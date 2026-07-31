@@ -2,9 +2,13 @@
 
 **Date:** 2026-07-31 · **Status:** open · **Owner:** rafael.nogueira
 
-Two agents study this independently, one on **claude opus**, one on **fable**, in
-separate worktrees. Do not coordinate. Divergent conclusions are the point — they get
-compared afterwards.
+Two agents study this independently, one on **claude opus**, one on **fable**. Do not
+coordinate. Divergent conclusions are the point — they get compared afterwards.
+
+⚠️ **You share one working tree with the other agent.** Write only your own findings file.
+**Do not run `git add`, `git commit`, `git checkout`, `git stash` or anything else that
+touches the index** — the other agent is working in the same directory at the same time and
+a concurrent index write will corrupt both of your work. Rafael commits at the end.
 
 ## Why this exists
 
@@ -93,9 +97,9 @@ it" is.
 
 ## Deliverable
 
-Write `findings/<your-model>.md` in your own worktree — `findings/claude.md` or
-`findings/fable.md`. Commit it on your branch. Do not merge, do not push, do not touch the
-other agent's file.
+Write `findings/claude.md` or `findings/fable.md` — whichever you were told is yours. That
+one file is the only thing you create or modify. Do not commit, do not merge, do not push,
+and do not read or touch the other agent's file.
 
 Structure it as: a **recommendation** (one of: use `--auto`+deny-list / adopt the
 third-party plugin / build our own / do nothing, and why), then the evidence for each
