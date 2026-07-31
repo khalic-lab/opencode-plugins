@@ -1,0 +1,4 @@
+# Third-party reference clone lives OUTSIDE this repo on purpose
+# (see SPIKE.md). Nothing vendored here.
+node_modules/
+findings/*.local.md
