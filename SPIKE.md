@@ -1,6 +1,6 @@
 # Spike — auto-mode for opencode, ideally driven by a local model
 
-**Date:** 2026-07-31 · **Status:** open · **Owner:** rafael.nogueira
+**Date:** 2026-07-31 · **Status:** resolved 2026-08-09 — built the plugin (see `README.md`, `plugin/`); decision followed findings/fable.md: own minimal plugin, local mlx classifier, shadow-first rollout · **Owner:** rafael.nogueira
 
 Two agents study this independently, one on **claude opus**, one on **fable**. Do not
 coordinate. Divergent conclusions are the point — they get compared afterwards.
