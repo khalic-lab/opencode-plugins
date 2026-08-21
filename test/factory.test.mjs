@@ -21,9 +21,12 @@ const realFetch = globalThis.fetch
 process.env.OPENCODE_LOCAL_CLASSIFIER_TRUST_OPTIONS = "1"
 afterEach(() => { globalThis.fetch = realFetch })
 
-function mockFetch(verdictText) {
-  return async (url) => {
+const flush = (ms) => new Promise((r) => setTimeout(r, ms))
+
+function mockFetch(verdictText, sink) {
+  return async (url, init) => {
     if (String(url).endsWith("/models")) return { ok: true, status: 200, json: async () => ({ data: [] }) }
+    if (sink) sink.push(JSON.parse(init?.body ?? "{}"))
     if (verdictText instanceof Error) throw verdictText
     return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: verdictText } }] }) }
   }
@@ -63,18 +66,19 @@ function mockClient({ tui = "ok" } = {}) {
   return client
 }
 
-async function makePlugin({ mode, verdict, client, logDir: forcedLogDir, directory = null }) {
+async function makePlugin({ mode, verdict, client, logDir: forcedLogDir, directory = null, options = {} }) {
   const logDir = forcedLogDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "lc-test-"))
-  globalThis.fetch = mockFetch(verdict)
+  const sent = []
+  globalThis.fetch = mockFetch(verdict, sent)
   const hooks = await LocalClassifierPlugin(
     { client, worktree: "/", directory },
-    { mode, logDir, countdownMs: 500, vetoHeadless: false },
+    { mode, logDir, countdownMs: 500, vetoHeadless: false, ...options },
   )
   const readLog = () =>
     fs.readdirSync(logDir).flatMap((f) =>
       fs.readFileSync(path.join(logDir, f), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)),
     )
-  return { hooks, readLog, logDir }
+  return { hooks, readLog, logDir, sent }
 }
 
 const asked = (id) => ({
@@ -85,6 +89,88 @@ const asked = (id) => ({
       patterns: ["ls"], metadata: { command: "ls ." }, always: [],
     },
   },
+})
+
+describe("the prompt prefix is kept warm", () => {
+  /**
+   * The model caches the prompt prefix, and the classifier's prefix is the
+   * whole system prompt. Warm, a classification prefills ~15 tokens and answers
+   * in ~300ms; cold, it prefills the entire prompt and takes seconds — which is
+   * where every latency-gate outlier in the shadow corpus came from. The prefix
+   * is evicted by other traffic on the shared model server, so warming has to
+   * repeat, not just happen once at startup.
+   */
+  const warmed = (sent) => sent.map((b) => b.messages?.[0]?.content ?? "")
+
+  test("startup warms both prompt families, without holding up init", async () => {
+    const { sent, readLog } = await makePlugin({
+      mode: "shadow", verdict: "VERDICT: SAFE\nREASON: ok", client: mockClient(),
+      options: { warmIntervalMs: 60_000 },
+    })
+    await flush(120)
+    const prompts = warmed(sent)
+    // One per family: a warm bash prefix does nothing for a directory ask.
+    expect(prompts.some((p) => /shell commands/i.test(p))).toBe(true)
+    expect(prompts.some((p) => /filesystem access/i.test(p))).toBe(true)
+    const warm = readLog().filter((l) => l.event === "classifier.warm")
+    expect(warm.length).toBe(2)
+    expect(warm.every((l) => l.ok === true)).toBe(true)
+  })
+
+  test("it keeps warming, because something else evicts the prefix mid-session", async () => {
+    const { readLog } = await makePlugin({
+      mode: "shadow", verdict: "VERDICT: SAFE\nREASON: ok", client: mockClient(),
+      options: { warmIntervalMs: 60 },
+    })
+    await flush(400)
+    // Startup pass plus at least one repeat; a single warm at init would leave
+    // an idle session cold again by the time the next permission arrives.
+    expect(readLog().filter((l) => l.event === "classifier.warm").length).toBeGreaterThan(2)
+  })
+
+  test("a warm that fails is logged and otherwise ignored", async () => {
+    const { readLog } = await makePlugin({
+      mode: "shadow", verdict: new Error("endpoint down"), client: mockClient(),
+      options: { warmIntervalMs: 60_000 },
+    })
+    await flush(120)
+    const warm = readLog().filter((l) => l.event === "classifier.warm")
+    expect(warm.length).toBeGreaterThan(0)
+    expect(warm.every((l) => l.ok === false)).toBe(true)
+    // Nothing about a failed warm may look like a real classification.
+    expect(readLog().some((l) => l.event === "classification")).toBe(false)
+  })
+
+  test("a warm is never mistaken for a real classification", async () => {
+    const { readLog, sent } = await makePlugin({
+      mode: "enforce", verdict: "VERDICT: SAFE\nREASON: ok", client: mockClient(),
+      options: { warmIntervalMs: 60_000 },
+    })
+    await flush(120)
+    expect(sent.length).toBeGreaterThan(0)
+    expect(readLog().some((l) => l.event === "classification")).toBe(false)
+    expect(readLog().some((l) => l.event === "action")).toBe(false)
+  })
+
+  test("off mode warms nothing — an inert plugin phones nowhere", async () => {
+    const { sent, readLog } = await makePlugin({
+      mode: "off", verdict: "VERDICT: SAFE\nREASON: ok", client: mockClient(),
+      options: { warmIntervalMs: 60 },
+    })
+    await flush(200)
+    expect(sent.length).toBe(0)
+    expect(readLog().some((l) => l.event === "classifier.warm")).toBe(false)
+  })
+
+  test("warmIntervalMs 0 turns it off", async () => {
+    const { sent, readLog } = await makePlugin({
+      mode: "shadow", verdict: "VERDICT: SAFE\nREASON: ok", client: mockClient(),
+      options: { warmIntervalMs: 0 },
+    })
+    await flush(200)
+    expect(sent.length).toBe(0)
+    expect(readLog().some((l) => l.event === "classifier.warm")).toBe(false)
+  })
 })
 
 describe("plugin factory invariants", () => {
@@ -447,7 +533,6 @@ describe("the toast probe fires after the TUI boot race, not into it", () => {
   // "tui.toast.show", and the event is non-durable — so a toast sent from the
   // factory body is dropped while the SDK still answers {data:true}. A probe
   // fired at init therefore tests nothing except the race. It has to wait.
-  const flush = (ms) => new Promise((r) => setTimeout(r, ms))
 
   test("the probe waits before firing, and does not hold up startup", async () => {
     process.env.OPENCODE_LOCAL_CLASSIFIER_TOAST_PROBE = "60"

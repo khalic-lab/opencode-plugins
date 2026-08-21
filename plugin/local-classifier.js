@@ -101,6 +101,15 @@ const DEFAULTS = Object.freeze({
   /** Sampling for the classifier call. */
   maxTokens: 160,
   temperature: 0,
+  /**
+   * How often to re-send a throwaway classification purely to keep the model's
+   * cached prompt prefix hot. Warm, a classification prefills ~15 tokens;
+   * cold, it prefills the whole system prompt, which is where every latency
+   * outlier in the shadow corpus came from. The prefix is evicted by other
+   * traffic on the same model server, so this has to repeat rather than run
+   * once at startup. 0 disables it.
+   */
+  warmIntervalMs: 4 * 60_000,
   /** Where JSONL logs go. */
   logDir: path.join(os.homedir(), ".local", "share", "opencode-local-classifier", "logs"),
   /**
@@ -112,6 +121,9 @@ const DEFAULTS = Object.freeze({
    */
   trustPluginOptions: false,
 })
+
+/** The one live prefix-warming timer; see the warmer in the factory below. */
+let activeWarmTimer = null
 
 const VALID_MODES = new Set(["shadow", "enforce", "off"])
 
@@ -215,7 +227,7 @@ function resolveConfig({ options, worktree, env = process.env, readFile = defaul
   // Field validation — every miss degrades to the default and is reported.
   const out = { ...merged }
   if (!VALID_MODES.has(out.mode)) { problems.push(`invalid mode ${JSON.stringify(out.mode)}`); out.mode = "shadow" }
-  for (const k of ["timeoutMs", "countdownMs", "breakerThreshold", "breakerCooldownMs", "maxTokens"]) {
+  for (const k of ["timeoutMs", "countdownMs", "breakerThreshold", "breakerCooldownMs", "maxTokens", "warmIntervalMs"]) {
     if (!Number.isFinite(out[k]) || out[k] < 0) { problems.push(`invalid ${k}`); out[k] = DEFAULTS[k] }
   }
   // The countdown is the human's window to beat an auto-approval; a config
@@ -847,6 +859,50 @@ const LocalClassifierPlugin = async (input, options) => {
   })()
 
   /**
+   * Keep the model's cached prompt prefix hot, one throwaway classification per
+   * prompt family. Measured on this box: warm, a classification prefills ~15
+   * tokens and answers in ~300 ms; cold, it prefills the entire system prompt.
+   * The two families have different prefixes, so warming one does nothing for
+   * the other.
+   *
+   * It repeats because the prefix does not survive on its own — the model
+   * server holds a bounded number of cached sequences and opencode's own
+   * traffic shares it. A real classification counts as a warm, so an active
+   * session never sends these at all.
+   */
+  let lastPrefixTouch = 0
+  // Module-scoped, not per-init: opencode can construct the plugin more than
+  // once in a process, and a timer per construction would pile up warm calls
+  // against a shared model server for the rest of the session.
+  if (activeWarmTimer) clearInterval(activeWarmTimer)
+  activeWarmTimer = null
+  if (config.mode !== "off" && config.warmIntervalMs > 0) {
+    const warmOnce = async () => {
+      lastPrefixTouch = Date.now()
+      for (const [kind, subject] of [["bash", "true"], ["external_directory", "/tmp/warm"]]) {
+        if (kind === "external_directory" && !config.externalDirectory) continue
+        const started = Date.now()
+        try {
+          // Deliberately NOT via classifyAndLog: a warm-up has no permission
+          // behind it, and a record that looks like a classification would
+          // enter the eval corpus as a decision nobody ever made.
+          const r = await classify({ kind, subject, config })
+          log.log("classifier.warm", { ok: !r.failure, kind, failure: r.failure ?? null, latency_ms: r.latencyMs ?? Date.now() - started })
+        } catch (e) {
+          log.log("classifier.warm", { ok: false, kind, error: e?.message ?? String(e) })
+        }
+      }
+    }
+    void warmOnce()
+    activeWarmTimer = setInterval(() => {
+      if (Date.now() - lastPrefixTouch < config.warmIntervalMs) return
+      void warmOnce()
+    }, Math.max(50, Math.min(config.warmIntervalMs, 30_000)))
+    // Never the reason a process stays alive.
+    activeWarmTimer.unref?.()
+  }
+
+  /**
    * Shared classify-and-log step. Returns the classification result record.
    */
   async function classifyAndLog({ kind, subject, permissionId, sessionID, extra = {} }) {
@@ -873,6 +929,7 @@ const LocalClassifierPlugin = async (input, options) => {
     }
 
     const queuedAt = Date.now()
+    lastPrefixTouch = queuedAt
     const depthAtEntry = queueDepth
     const gen = breaker.generation()
     const result = await enqueue(() => classify({ kind, subject, config }))
