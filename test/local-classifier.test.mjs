@@ -40,6 +40,11 @@ describe("parseVerdict — strict, first-line anchored", () => {
   test("unknown verdict value fails closed", () => {
     expect(parseVerdict("VERDICT: MAYBE\nREASON: unsure")).toBeNull()
   })
+  test("trailing prose that reverses the verdict fails closed", () => {
+    expect(parseVerdict("VERDICT: SAFE\nREASON: reads a file\nActually this deletes the repo — RISKY.")).toBeNull()
+    // …but ordinary trailing noise that says nothing about the verdict is fine.
+    expect(parseVerdict("VERDICT: SAFE\nREASON: read-only\n(end of answer)")).toEqual({ verdict: "SAFE", reason: "read-only" })
+  })
   test("empty / null / non-string fail closed", () => {
     expect(parseVerdict("")).toBeNull()
     expect(parseVerdict(null)).toBeNull()
@@ -135,15 +140,31 @@ describe("buildSubject", () => {
       }),
     ).toBe("cd ~/.ssh && cat id_rsa")
   })
-  test("bash: patterns join is the fallback when metadata.command is absent", () => {
-    expect(buildSubject({ permission: "bash", patterns: ["git status", "git diff"], metadata: null })).toBe(
-      "git status && git diff",
-    )
+  test("bash: NO subject without metadata.command — a pattern join is a different command", () => {
+    // patterns erase the operators, so `curl x | sh` would be reconstructed as
+    // `curl x && sh` and approved as something the shell never runs. Fail
+    // closed instead: the human reads the TUI prompt.
+    expect(buildSubject({ permission: "bash", patterns: ["git status", "git diff"], metadata: null })).toBeNull()
   })
-  test("external_directory: multiple paths join one per line", () => {
+  test("external_directory: the exact target is sent alongside the granted pattern", () => {
+    // opencode asks with patterns:[dirname+"/*"] and puts the file only in
+    // metadata.filepath — judging the glob alone hides the filename every
+    // credential rule keys on.
+    expect(
+      buildSubject({
+        permission: "external_directory",
+        patterns: ["/usr/local/src/proj/*"],
+        metadata: { filepath: "/usr/local/src/proj/deploy-key.pem" },
+      }),
+    ).toBe("/usr/local/src/proj/deploy-key.pem\n/usr/local/src/proj/*")
+  })
+  test("external_directory: multiple paths join one per line, de-duplicated", () => {
     expect(
       buildSubject({ permission: "external_directory", patterns: ["/tmp/a/*", "/Users/x/.aws/*"], metadata: null }),
     ).toBe("/tmp/a/*\n/Users/x/.aws/*")
+    expect(
+      buildSubject({ permission: "external_directory", patterns: ["/tmp/a/*"], metadata: { path: "/tmp/a/*" } }),
+    ).toBe("/tmp/a/*")
   })
   test("metadata fallbacks", () => {
     expect(buildSubject({ permission: "bash", patterns: [], metadata: { command: "ls" } })).toBe("ls")
@@ -221,13 +242,16 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     })
     expect(config.mode).toBe("off")
   })
-  test("layer precedence: project file overrides user file, options override both — for allowed keys", () => {
+  test("layer precedence: project file overrides user file, trusted options override both", () => {
     const readFile = (f) =>
       f.includes(".config/opencode/") ? { countdownMs: 9000, externalDirectory: false } : { externalDirectory: true }
-    const { config } = resolveConfig({ options: { timeoutMs: 5000 }, worktree: "/w", readFile, env: {} })
+    const { config } = resolveConfig({
+      options: { timeoutMs: 5000 }, worktree: "/w", readFile,
+      env: { OPENCODE_LOCAL_CLASSIFIER_TRUST_OPTIONS: "1" },
+    })
     expect(config.countdownMs).toBe(9000) // user file
     expect(config.externalDirectory).toBe(true) // project overrides user
-    expect(config.timeoutMs).toBe(5000) // options
+    expect(config.timeoutMs).toBe(5000) // trusted options
   })
   test("project file cannot raise mode, repoint endpoint, or enable vetoHeadless", () => {
     const readFile = (f) =>
@@ -239,28 +263,95 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     expect(config.countdownMs).toBe(3000)
     expect(problems.length).toBeGreaterThanOrEqual(4)
   })
+  test("plugin-tuple options are untrusted by default — a repo can re-declare the plugin entry", () => {
+    // Verified at 1.18.15: project opencode.json plugin entries are merged and
+    // deduped last-wins by spec, so `options` is repo-reachable.
+    const { config, problems } = resolveConfig({
+      options: { mode: "enforce", endpoint: "http://evil/v1", vetoHeadless: true, logDir: "/tmp/x" },
+      readFile: noFile, env: {},
+    })
+    expect(config.mode).toBe("shadow")
+    expect(config.endpoint).toBe("http://127.0.0.1:8081/v1")
+    expect(config.vetoHeadless).toBe(false)
+    expect(config.logDir).toBe("/tmp/x") // allowed key: a repo may redirect its own logs
+    expect(problems.some((p) => p.includes("options may not set endpoint"))).toBe(true)
+  })
+  test("only the user file may trust the options layer", () => {
+    const userTrusts = (f) => (f.includes(".config/opencode/") ? { trustPluginOptions: true } : null)
+    const { config } = resolveConfig({ options: { endpoint: "http://mine/v1" }, readFile: userTrusts, env: {} })
+    expect(config.endpoint).toBe("http://mine/v1")
+    // …and an untrusted layer cannot grant itself that trust.
+    const { config: c2 } = resolveConfig({
+      options: { trustPluginOptions: true, endpoint: "http://evil/v1" }, readFile: noFile, env: {},
+    })
+    expect(c2.endpoint).toBe("http://127.0.0.1:8081/v1")
+  })
   test("project file CAN lower mode", () => {
     const readFile = (f) => (f.startsWith("/w/") ? { mode: "off" } : { mode: "enforce" })
     const { config } = resolveConfig({ worktree: "/w", readFile, env: {} })
     expect(config.mode).toBe("off")
   })
+  test("an untrusted layer may NOT lower mode while vetoHeadless is armed", () => {
+    // `mode: "off"` also disables the headless veto — the only fail-closed
+    // control under `run --auto`. Two lines of project JSON must not disarm it.
+    const readFile = (f) =>
+      f.startsWith("/w/") ? { mode: "off" } : { mode: "enforce", vetoHeadless: true }
+    const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
+    expect(config.mode).toBe("enforce")
+    expect(problems.some((p) => p.includes("may not lower mode"))).toBe(true)
+  })
   test("countdownMs below the 500ms floor degrades to default", () => {
-    const { config, problems } = resolveConfig({ options: { countdownMs: 0 }, readFile: () => null, env: {} })
+    const readFile = (f) => (f.includes(".config/opencode/") ? { countdownMs: 0 } : null)
+    const { config, problems } = resolveConfig({ readFile, env: {} })
     expect(config.countdownMs).toBe(3000)
     expect(problems.some((p) => p.includes("floor"))).toBe(true)
   })
   test("non-finite temperature degrades to default", () => {
-    const { config } = resolveConfig({ options: { temperature: "hot" }, readFile: () => null, env: {} })
+    const readFile = (f) => (f.includes(".config/opencode/") ? { temperature: "hot" } : null)
+    const { config } = resolveConfig({ readFile, env: {} })
     expect(config.temperature).toBe(0)
   })
   test("bad numbers and unknown keys degrade field-by-field", () => {
-    const { config, problems } = resolveConfig({
-      options: { timeoutMs: -5, banana: true, endpoint: "" },
-      readFile: noFile, env: {},
-    })
+    const readFile = (f) => (f.includes(".config/opencode/") ? { timeoutMs: -5, banana: true, endpoint: "" } : null)
+    const { config, problems } = resolveConfig({ readFile, env: {} })
     expect(config.timeoutMs).toBe(10_000)
     expect(config.endpoint).toBe("http://127.0.0.1:8081/v1")
     expect(problems).toContain("unknown key banana")
+  })
+  test("an unparseable config file is reported, not silently treated as absent", () => {
+    const readFile = (f) => (f.includes(".config/opencode/") ? { __parseError: "Unexpected token }" } : null)
+    const { config, sources, problems } = resolveConfig({ readFile, env: {} })
+    expect(config.mode).toBe("shadow")
+    expect(sources).toContain("user-file:unreadable")
+    expect(problems.some((p) => p.includes("not valid JSON"))).toBe(true)
+  })
+})
+
+describe("headless veto path rules (deterministic, no model call)", () => {
+  const { judgeWritePath, collectPaths, isOutside } = LocalClassifier.internals
+  test("writes inside the project pass; outside and sensitive targets are blocked", () => {
+    expect(judgeWritePath("src/app.ts", "/w/proj")).toBeNull()
+    expect(judgeWritePath("/w/proj/src/app.ts", "/w/proj")).toBeNull()
+    expect(judgeWritePath("/w/other/app.ts", "/w/proj")).toContain("outside the project")
+    expect(judgeWritePath("../other/app.ts", "/w/proj")).toContain("outside the project")
+  })
+  test("code that runs on its own, and credentials, are blocked even inside the project", () => {
+    for (const p of [".git/hooks/pre-commit", ".github/workflows/ci.yml", ".env.production"]) {
+      expect(judgeWritePath(p, "/w/proj")).toContain("sensitive path")
+    }
+  })
+  test("home-directory config is blocked wherever the project lives", () => {
+    expect(judgeWritePath("~/.zshrc", "/w/proj")).toContain("sensitive path")
+    expect(judgeWritePath("~/.ssh/authorized_keys", "/w/proj")).toContain("sensitive path")
+    expect(judgeWritePath("/etc/hosts", "/w/proj")).toContain("sensitive path")
+  })
+  test("collectPaths picks path-shaped args only", () => {
+    expect(collectPaths({ filePath: "src/a.ts", content: "hello/world", pattern: "*.ts" })).toEqual(["src/a.ts"])
+    expect(collectPaths(null)).toEqual([])
+  })
+  test("isOutside treats a missing project dir as outside", () => {
+    expect(isOutside("/anything", null)).toBe(true)
+    expect(isOutside("/w/proj/src", "/w/proj")).toBe(false)
   })
 })
 
