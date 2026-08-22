@@ -24,7 +24,7 @@
 import { createSignal, Show } from "solid-js"
 import os from "node:os"
 import path from "node:path"
-import { emptyState, apply, view, createTailer } from "./tui-view.js"
+import { emptyState, apply, view, createTailer, HOLD_MS } from "./tui-view.js"
 
 /**
  * Four times a second. The countdown only changes at 1 Hz, but the log is also
@@ -56,6 +56,9 @@ export default {
   id: "local-classifier-tui",
   tui: async (api, options) => {
     const dir = typeof options?.logDir === "string" ? options.logDir : DEFAULT_LOG_DIR
+    // How long a finished permission lingers. Settable because "long enough to
+    // read" is a property of the reader, not of the plugin.
+    const holdMs = Number.isFinite(options?.holdMs) && options.holdMs > 0 ? options.holdMs : HOLD_MS
     const tailer = createTailer({ dir })
     const [shown, setShown] = createSignal(null)
     let state = emptyState()
@@ -63,7 +66,7 @@ export default {
     const timer = setInterval(() => {
       const now = Date.now()
       for (const record of tailer.poll()) state = apply(state, record, now)
-      const next = view(state, now)
+      const next = view(state, now, holdMs)
       // Only when the words change: setting the signal on every tick would
       // re-render the box four times a second to say the same thing.
       if (!same(shown(), next)) setShown(next)

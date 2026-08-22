@@ -16,8 +16,14 @@
 import fs from "node:fs"
 import path from "node:path"
 
-/** How long a finished permission stays on screen before the box clears. */
-export const HOLD_MS = 4_000
+/**
+ * How long a FINISHED permission stays on screen before the box clears — one
+ * whose prompt opencode has already taken down, so the box is the only record
+ * left of what was approved on the human's behalf. Long enough to read three
+ * lines, which four seconds was not. Nothing else is timed against it: a
+ * prompt still waiting for an answer keeps its box for as long as it waits.
+ */
+export const HOLD_MS = 12_000
 
 /**
  * A long session asks for hundreds of permissions and every one of them would
@@ -98,13 +104,25 @@ export function apply(state, record, now = Date.now()) {
     case "action.countdown":
       patch({ countdownAt: at(record, now), countdownMs: record.countdown_ms ?? null })
       break
-    case "action":
+    case "action": {
+      // Only two of these mean the prompt has left the screen: the plugin
+      // replied ("approved"), or it found the human already had
+      // ("human_won_race"). "none" — a RISKY verdict, or a classifier failure
+      // — plus shadow mode's "would_approve" and a reply that never landed
+      // ("approve_failed") all leave the dialog sitting exactly where it was,
+      // and those are the boxes that most need to stay up beside it. Starting
+      // the hold timer on them is what made a RISKY box disappear four
+      // seconds into a prompt the human had not finished reading.
+      const closed = record.decided === "approved" || record.decided === "human_won_race"
       patch({
         decided: record.decided ?? null,
         why: record.why ?? null,
-        resolvedAt: record.decided === "pending" ? null : at(record, now),
+        // Never clears one already set: `human.decision` can land first, and
+        // its answer is the one that took the prompt down.
+        resolvedAt: closed ? at(record, now) : (entries[i]?.resolvedAt ?? null),
       })
       break
+    }
     case "self.decision":
       patch({ decided: entries[i]?.decided ?? "approved", resolvedAt: at(record, now) })
       break
@@ -136,6 +154,12 @@ const MAX_LINE = 200
  * timeout plus its queue wait is well inside this; past it, the line that
  * would have resolved the box is not coming, and a permanent "classifying…"
  * is worse than nothing.
+ *
+ * A prompt waiting on the HUMAN gets no equivalent bound, and the asymmetry is
+ * deliberate: the classifier promised an answer within a known timeout, so its
+ * silence is a fault. A human owes nothing — the shadow logs put the median
+ * reply at 25 minutes — and any deadline here would erase a box while the
+ * prompt it explains is still on screen, which is the bug this replaced.
  */
 const PENDING_TIMEOUT_MS = 30_000
 const oneLine = (s) => {
@@ -147,13 +171,15 @@ const oneLine = (s) => {
 const HUMAN_VERB = { reject: "you rejected it", once: "you approved it", always: "you approved it — always" }
 
 /**
- * The newest permission worth drawing, already turned into words.
+ * The newest permission worth drawing, already turned into words. An entry
+ * stays drawable until its prompt is off the screen and `holdMs` has passed;
+ * a prompt still waiting on the human has no such clock.
  * @returns {{id: string, tone: string, headline: string, command: string|null, detail: string|null}|null}
  */
-export function view(state, now = Date.now()) {
+export function view(state, now = Date.now(), holdMs = HOLD_MS) {
   for (let i = state.entries.length - 1; i >= 0; i--) {
     const e = state.entries[i]
-    if (e.resolvedAt !== null && now - e.resolvedAt > HOLD_MS) continue
+    if (e.resolvedAt !== null && now - e.resolvedAt > holdMs) continue
     const base = { id: e.id, command: oneLine(e.command), detail: oneLine(e.reason ?? null) }
 
     if (e.human) return { ...base, tone: "done", headline: HUMAN_VERB[e.human] ?? `you answered — ${e.human}` }

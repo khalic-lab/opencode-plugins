@@ -263,3 +263,80 @@ describe("the tailer reads the classifier's log the way a follower must", () => 
     expect(t.poll()).toEqual([])
   })
 })
+
+describe("a prompt the plugin refuses to answer keeps its box", () => {
+  // The report that produced these: a RISKY box vanished four seconds into a
+  // prompt the human had not finished reading. `action` with decided "none" is
+  // the plugin saying it will NOT reply — the dialog stays exactly where it is
+  // — and treating that as "resolved" started the hold timer anyway.
+  test("a RISKY ask is still on screen long after the hold would have expired", () => {
+    const s = feed([
+      received("p1", "rm -rf build"),
+      classified("p1", "RISKY", "deletes files", T0 + 800),
+      action("p1", "none", T0 + 800, { verdict: "RISKY" }),
+    ])
+    const v = view(s, T0 + 800 + HOLD_MS * 10)
+    expect(v).not.toBeNull()
+    expect(v.tone).toBe("risky")
+    expect(v.headline).toMatch(/RISKY/)
+  })
+
+  test("it clears once the human answers, and not before", () => {
+    const records = [
+      received("p1", "rm -rf build"),
+      classified("p1", "RISKY", "deletes files", T0 + 800),
+      action("p1", "none", T0 + 800, { verdict: "RISKY" }),
+    ]
+    expect(view(feed(records), T0 + 30_000).tone).toBe("risky")
+    const answered = feed([
+      ...records,
+      { ts: iso(T0 + 30_000), event: "human.decision", permission_id: "p1", response: "reject" },
+    ])
+    expect(answered && view(answered, T0 + 30_100).tone).toBe("done")
+    expect(view(answered, T0 + 30_000 + HOLD_MS + 1)).toBeNull()
+  })
+
+  test("a shadow-mode would-approve stays up, because the prompt is still the human's", () => {
+    const s = feed([
+      received("p1", "npm ci"),
+      classified("p1", "SAFE", "ok", T0 + 800),
+      action("p1", "would_approve", T0 + 800),
+    ])
+    const v = view(s, T0 + 800 + HOLD_MS * 5)
+    expect(v).not.toBeNull()
+    expect(v.headline).toMatch(/would auto-approve/)
+  })
+
+  test("a failed auto-approval stays up longest of all — the human has to finish it", () => {
+    const s = feed([
+      received("p1", "npm ci"), classified("p1", "SAFE", "ok"), countdown("p1"),
+      action("p1", "approve_failed"),
+    ])
+    const v = view(s, T0 + 5_100 + HOLD_MS * 5)
+    expect(v).not.toBeNull()
+    expect(v.tone).toBe("failed")
+    expect(v.headline).toMatch(/did not reach opencode/)
+  })
+
+  // `self.decision` is the one record that resolves a box the plugin did not
+  // close itself, and it is right to: it is only ever written off a real
+  // `permission.replied`, which means opencode has already taken the prompt
+  // down — the transport erred but the server took the reply anyway. Without
+  // that record the same `approve_failed` stays up, because then the prompt
+  // really is still sitting there.
+  test("approve_failed clears only once opencode confirms it took the reply", () => {
+    const base = [received("p1", "npm ci"), classified("p1", "SAFE", "ok"), countdown("p1"), action("p1", "approve_failed")]
+    expect(view(feed(base), T0 + 5_100 + HOLD_MS * 5).tone).toBe("failed")
+
+    const confirmed = feed([
+      ...base,
+      { ts: iso(T0 + 5_150), event: "self.decision", permission_id: "p1", response: "once" },
+    ])
+    expect(view(confirmed, T0 + 5_200).tone).toBe("failed")
+    expect(view(confirmed, T0 + 5_150 + HOLD_MS + 1)).toBeNull()
+  })
+
+  test("the hold is long enough to read three lines", () => {
+    expect(HOLD_MS).toBeGreaterThanOrEqual(10_000)
+  })
+})
