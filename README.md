@@ -546,6 +546,74 @@ free once warm, so a future attempt on a stronger local model is not blocked by
 latency — only by whether the model can hold the taxonomy. That measurement is
 what `warmIntervalMs` is built on.
 
+## The other plugin: `title-fallback`
+
+A second, unrelated plugin in the same repo. It has nothing to do with
+permissions — it names sessions that opencode failed to name.
+
+The global `small_model` moved on 2026-08-23 to Apple's on-device model
+(`afm/apple/foundation-models-on-device`, served by `mlxctl-afm-server` at
+`http://127.0.0.1:8110/v1`), which is slower than e4b when both are idle but
+faster under load, because it does not contend for the GPU the main model is
+saturating — and the title call always fires while the main model is producing
+its first tokens. At opencode 1.18.20 `small_model` has exactly two consumers,
+found by grepping `getSmallModel` in the binary: `SessionPrompt.ensureTitle` and
+`ProjectCopyHttpApi.generateName`. Compaction and `session.summarize` use the
+main model, so a 4k window never reaches them.
+
+What a 4k window does reach is the title. `ensureTitle` sends the title agent's
+~525-token system prompt plus the **whole** first user message, so a first
+message past roughly 13 KB of text returns `400 context_length_exceeded`. That
+is not retried: the function is guarded by
+`history.filter(isRealUser).length !== 1`, so from the second message onward it
+returns early and the session keeps `New session - <ISO>` permanently. Text file
+attachments are free — the message converter drops `text/plain` and
+`application/x-directory` parts outright — but images and PDFs pass through as
+media and will blow the window too.
+
+`plugin/title-fallback.js` closes that. On `session.idle` it re-reads a
+top-level session and, if the title still matches opencode's own default-title
+pattern (transcribed from the binary), generates one from the **first 4000
+characters** of the first user message; a model failure falls back to the
+50-character slice that `opencode run --title` uses with no value. Truncation is
+the whole trick — 4000 characters is ~1.2k tokens against the ~3.7k ceiling, so
+the repair path cannot overflow the path it repairs. Verified end to end against
+a 25,714-character first message: AFM 400'd and the session came back as "Stack
+trace from nightly build".
+
+It is a **separate file** from `local-classifier.js` on purpose. That plugin
+auto-approves permissions in enforce mode; a cosmetic feature has no business
+sharing its module, its config, or its failure surface. Same one-export rule
+applies, and a test asserts it.
+
+```sh
+mkdir -p ~/.config/opencode/title-fallback
+cp plugin/title-fallback.js ~/.config/opencode/title-fallback/
+```
+
+then a second entry in the same `plugin` array in `~/.config/opencode/opencode.json`:
+
+```json
+{ "plugin": [
+  "file:///Users/<you>/.config/opencode/local-classifier/local-classifier.js",
+  "file:///Users/<you>/.config/opencode/title-fallback/title-fallback.js"
+] }
+```
+
+`OPENCODE_TITLE_FALLBACK_ENDPOINT` / `_MODEL` / `_LOG_DIR` override the
+defaults. `OPENCODE_TITLE_FALLBACK_DEBUG=1` logs every `session.*` event the
+hook sees and every silent decline — without it the log carries only
+`plugin.init` and the repairs, since the overwhelming majority of sessions are
+ones opencode titled correctly.
+
+**Two things that cost time verifying it.** The repair runs in the SERVER
+process, so it lands seconds after `opencode run --attach` returns — reading the
+log the moment the client exits shows nothing and looks exactly like failure.
+And a one-shot headless `opencode run` (no `--attach`) exits at idle before the
+hook finishes, so the repair does not land there; the TUI and `opencode serve`
+are long-lived and do. Verify with `opencode serve --port N` plus
+`opencode run --attach`, and wait.
+
 ## Known limits / upgrade watch
 
 - The reply-route order is: the v2 route for v2 asks, then
