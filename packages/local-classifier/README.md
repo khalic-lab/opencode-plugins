@@ -135,7 +135,11 @@ the eval corpus.
 ## The full record
 
 The eval harness, the adversarial corpora, the prompt-version history and the reasoning
-behind every one of these decisions live in the repository this package is built from.
+behind every one of these decisions live in
+[khalic-lab/opencode-plugins](https://github.com/khalic-lab/opencode-plugins), which this
+package is built from. Start with the root `README.md` — in particular the account of why
+importing Claude Code's own permission rubric made the classifier measurably worse, which is
+the most useful negative result in there.
 
 ## License
 

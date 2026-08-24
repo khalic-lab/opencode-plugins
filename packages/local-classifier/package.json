@@ -4,6 +4,13 @@
   "description": "Auto-approve opencode permission prompts using a local model as safety classifier. Fail-closed, shadow-mode first.",
   "license": "MIT",
   "author": "Rafael Nogueira",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/khalic-lab/opencode-plugins.git",
+    "directory": "packages/local-classifier"
+  },
+  "homepage": "https://github.com/khalic-lab/opencode-plugins/tree/main/packages/local-classifier#readme",
+  "bugs": "https://github.com/khalic-lab/opencode-plugins/issues",
   "type": "module",
   "main": "./local-classifier.js",
   "exports": {
