@@ -2,3 +2,6 @@
 # (see SPIKE.md). Nothing vendored here.
 node_modules/
 findings/*.local.md
+
+# Machine-local Claude Code settings — names internal MCP servers, never public
+.claude/settings.local.json
