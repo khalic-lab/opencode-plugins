@@ -17,7 +17,7 @@
     "tui-view.js"
   ],
   "engines": {
-    "opencode": ">=1.18.0"
+    "opencode": ">=1.18.20"
   },
   "keywords": [
     "opencode",

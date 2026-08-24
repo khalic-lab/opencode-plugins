@@ -577,3 +577,27 @@ describe("the toast probe fires after the TUI boot race, not into it", () => {
     expect(client.toasts.length).toBe(0)
   })
 })
+
+describe("module shape", () => {
+  test("exactly one export — a second one can poison the whole load batch", async () => {
+    // opencode's loader has no exports map to narrow this: with no default
+    // export it falls through to the legacy path, which calls Object.values(mod)
+    // and treats every value as a factory. A stray helper export throws
+    // "Plugin export is not a function" and takes the whole load with it.
+    const module = await import("../local-classifier.js")
+    expect(Object.keys(module)).toEqual(["LocalClassifier"])
+  })
+
+  test("the manifest's three entry points all name files that exist", async () => {
+    // exports["./server"] and exports["./tui"] are the only keys opencode reads,
+    // and it never reads exports["."]. A typo in any of them is a plugin that
+    // installs cleanly and does nothing.
+    const pkg = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+    for (const key of [".", "./server", "./tui"]) {
+      const target = pkg.exports[key]
+      expect(typeof target).toBe("string")
+      expect(fs.existsSync(new URL(`../${target.replace(/^\.\//, "")}`, import.meta.url))).toBe(true)
+    }
+    expect(fs.existsSync(new URL(`../${pkg.main.replace(/^\.\//, "")}`, import.meta.url))).toBe(true)
+  })
+})

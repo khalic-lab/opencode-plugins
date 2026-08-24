@@ -163,11 +163,12 @@ Two loader gotchas, both observed live at 1.18.10: a `file://` entry pointing
 stage the file under `~/.config/opencode/` and re-copy on upgrade; and
 symlinks did not load either, so copy the real file.
 
-That first one no longer holds at 1.18.20. A `file://` TUI entry pointing into
-`~/.cache/opencode/packages/…/node_modules/…` loaded and painted, verified with
-`eval/tui-e2e.py`. Staging under `~/.config/opencode/` is still the stable
-address to write into a config file, but it is no longer a requirement of the
-loader. After editing the plugin,
+That first one does not hold for the TUI loader at 1.18.20: a `file://` TUI
+entry pointing into `~/.cache/opencode/packages/…/node_modules/…` loaded and
+painted, verified with `eval/tui-e2e.py`. Whether the SERVER loader still
+enforces it was not retested — the two are different loaders and only the TUI
+one was measured. Staging under `~/.config/opencode/` remains the stable address
+to write into a config file either way. After editing the plugin,
 re-run `bun test` + `node eval/smoke.mjs`, re-copy, and restart opencode.
 
 Because the tested file and the running file are different files,
