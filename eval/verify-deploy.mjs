@@ -23,7 +23,7 @@ import crypto from "node:crypto"
 import { fileURLToPath } from "node:url"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-const repoDir = path.join(here, "..", "plugin")
+const repoDir = path.join(here, "..", "packages", "local-classifier")
 const deployDir = process.argv[2] ?? path.join(os.homedir(), ".config", "opencode", "local-classifier")
 const FILES = ["local-classifier.js", "local-classifier-tui.tsx", "tui-view.js"]
 

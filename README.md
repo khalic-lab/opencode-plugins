@@ -114,7 +114,7 @@ the offline eval can replay the exact production path with plain HTTP.
 
 ## Install
 
-`plugin/local-classifier.js` is a single self-contained file whose **only
+`packages/local-classifier/local-classifier.js` is a single self-contained file whose **only
 export is the factory** (helpers hang off `LocalClassifier.internals` for
 tests). That shape is load-bearing: opencode's loader calls every export of a
 plugin module as a factory, and one non-function export can poison an entire
@@ -124,7 +124,7 @@ Install (as deployed on this machine):
 
 ```sh
 mkdir -p ~/.config/opencode/local-classifier
-cp plugin/local-classifier.js plugin/local-classifier-tui.tsx plugin/tui-view.js \
+cp packages/local-classifier/local-classifier.js packages/local-classifier/local-classifier-tui.tsx packages/local-classifier/tui-view.js \
    ~/.config/opencode/local-classifier/
 ```
 
@@ -397,7 +397,7 @@ tested one.
 ## The box in the TUI
 
 Toasts vanish, and only one is on screen at a time. The persistent version is
-`plugin/local-classifier-tui.tsx`, a **TUI plugin** — a second, separate module,
+`packages/local-classifier/local-classifier-tui.tsx`, a **TUI plugin** — a second, separate module,
 because opencode's plugin type is `{ server }` or `{ tui }` and never both. It
 draws a bordered box in the `app_bottom` slot, under the prompt:
 
@@ -472,7 +472,7 @@ in the docs:
   title is drawn into the top border line, which is where the shape above comes
   from.
 
-`plugin/tui-view.js` holds everything with a decision in it — the fold over log
+`packages/local-classifier/tui-view.js` holds everything with a decision in it — the fold over log
 records, the words, the truncation, the log tailer — and imports nothing from
 opencode, so `bun test` can reach it. The `.tsx` only subscribes, ticks and
 draws. That split is what makes any of this testable: `bun test` cannot resolve

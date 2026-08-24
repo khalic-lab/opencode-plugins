@@ -12,7 +12,7 @@ import { describe, test, expect } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { emptyState, apply, view, createTailer, HOLD_MS } from "../plugin/tui-view.js"
+import { emptyState, apply, view, createTailer, HOLD_MS } from "../tui-view.js"
 
 const T0 = 1_700_000_000_000
 const iso = (ms) => new Date(ms).toISOString()

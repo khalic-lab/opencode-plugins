@@ -12,7 +12,7 @@ import { describe, test, expect, afterEach } from "bun:test"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { LocalClassifier as LocalClassifierPlugin } from "../plugin/local-classifier.js"
+import { LocalClassifier as LocalClassifierPlugin } from "../local-classifier.js"
 
 const realFetch = globalThis.fetch
 // The tuple `options` layer is untrusted by default (a cloned repo can supply

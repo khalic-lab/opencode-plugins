@@ -1,4 +1,4 @@
-import { LocalClassifier } from "../plugin/local-classifier.js"
+import { LocalClassifier } from "../packages/local-classifier/local-classifier.js"
 import fs from "node:fs"
 const { classify, resolveConfig } = LocalClassifier.internals
 const { config } = resolveConfig({})

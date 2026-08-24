@@ -1,0 +1,14 @@
+{
+  "name": "opencode-automode-workspace",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "test": "bun test",
+    "smoke": "node eval/smoke.mjs",
+    "hardcases": "node eval/hardcases.mjs",
+    "analyze": "node eval/analyze-logs.mjs",
+    "verify-deploy": "node eval/verify-deploy.mjs"
+  }
+}

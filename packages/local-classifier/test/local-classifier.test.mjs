@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { LocalClassifier } from "../plugin/local-classifier.js"
+import { LocalClassifier } from "../local-classifier.js"
 
 const {
   parseVerdict,

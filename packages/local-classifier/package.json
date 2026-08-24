@@ -1,0 +1,30 @@
+{
+  "name": "opencode-local-classifier",
+  "version": "0.1.0",
+  "description": "Auto-approve opencode permission prompts using a local model as safety classifier. Fail-closed, shadow-mode first.",
+  "license": "MIT",
+  "author": "Rafael Nogueira",
+  "type": "module",
+  "main": "./local-classifier.js",
+  "exports": {
+    ".": "./local-classifier.js",
+    "./server": "./local-classifier.js",
+    "./tui": "./local-classifier-tui.tsx"
+  },
+  "files": [
+    "local-classifier.js",
+    "local-classifier-tui.tsx",
+    "tui-view.js"
+  ],
+  "engines": {
+    "opencode": ">=1.18.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "permissions",
+    "classifier",
+    "local-llm",
+    "mlx"
+  ]
+}

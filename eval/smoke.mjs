@@ -15,7 +15,7 @@
  */
 
 import fs from "node:fs"
-import { LocalClassifier } from "../plugin/local-classifier.js"
+import { LocalClassifier } from "../packages/local-classifier/local-classifier.js"
 
 const { classify, resolveConfig, PROMPT_VERSION } = LocalClassifier.internals
 
