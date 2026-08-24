@@ -31,23 +31,38 @@ Verdicts depend on the served model, so a model change means a fresh shadow peri
 
 ## Install
 
-The server plugin and the TUI box are two different kinds of opencode plugin, and each kind
-is read from its own config file. Both come from this one package.
-
-`~/.config/opencode/opencode.json` — the classifier itself:
+The classifier goes in `~/.config/opencode/opencode.json`:
 
 ```json
 { "plugin": ["opencode-local-classifier"] }
 ```
 
-`~/.config/opencode/tui.json` — a **different file** — for the status box under the prompt:
+That is the whole install for the classifier itself.
 
-```json
-{ "plugin": ["opencode-local-classifier"] }
+The status box under the prompt is a **TUI plugin**, which is a different kind, read from a
+different file — and on opencode 1.18.20 the TUI loader does not resolve npm package names,
+only paths. Measured, not assumed: the same `.tsx` paints when addressed by a path and
+paints nothing when addressed by the package name. So the box needs one copy:
+
+```sh
+mkdir -p ~/.config/opencode/local-classifier
+cp ~/.cache/opencode/packages/opencode-local-classifier/node_modules/opencode-local-classifier/{local-classifier-tui.tsx,tui-view.js} \
+   ~/.config/opencode/local-classifier/
 ```
 
-Putting the package in only `opencode.json` gets you the classifier with no box. Putting it
-in only `tui.json` gets you a box with nothing to draw.
+and then in `~/.config/opencode/tui.json` — a **different file** from `opencode.json`:
+
+```json
+{ "plugin": ["file:///Users/<you>/.config/opencode/local-classifier/local-classifier-tui.tsx"] }
+```
+
+Both files are needed: the `.tsx` draws, and it imports its words from `tui-view.js` next to
+it. You can point `tui.json` straight into the cache directory above and skip the copy
+entirely — that works — but the cache path is keyed on the spec string and is not a stable
+address to write into a config file.
+
+The classifier works without any of this. Skipping the box costs you the persistent display;
+the toasts still explain each auto-approval.
 
 Note that opencode installs an npm plugin once and then never re-checks it: the cache is
 keyed on the literal spec string, so a bare name is fetched on first use and not refreshed

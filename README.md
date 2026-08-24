@@ -120,6 +120,18 @@ tests). That shape is load-bearing: opencode's loader calls every export of a
 plugin module as a factory, and one non-function export can poison an entire
 plugin load batch ("Plugin export is not a function") — verified at 1.18.10.
 
+The classifier is also packaged as `opencode-local-classifier` in
+`packages/local-classifier/`, whose own README is the user-facing one. From npm
+the classifier installs with `{ "plugin": ["opencode-local-classifier"] }` and
+nothing else — verified by version-marking a packaged copy, installing it into
+opencode's own package cache and running it beside the `file://` install, where
+both initialised and recorded the same permission.
+
+The box does not come with it. opencode 1.18.20's TUI loader resolves paths but
+not npm package names, so `eval/tui-e2e.py` passes against a `file://` entry and
+paints nothing against the package name. The two TUI files still need copying;
+the copy below does that and is unchanged.
+
 Install (as deployed on this machine):
 
 ```sh
@@ -149,7 +161,13 @@ rejects it with "must default export an object with `server()`" in
 Two loader gotchas, both observed live at 1.18.10: a `file://` entry pointing
 **outside** the config root (e.g. into a repo checkout) is silently ignored —
 stage the file under `~/.config/opencode/` and re-copy on upgrade; and
-symlinks did not load either, so copy the real file. After editing the plugin,
+symlinks did not load either, so copy the real file.
+
+That first one no longer holds at 1.18.20. A `file://` TUI entry pointing into
+`~/.cache/opencode/packages/…/node_modules/…` loaded and painted, verified with
+`eval/tui-e2e.py`. Staging under `~/.config/opencode/` is still the stable
+address to write into a config file, but it is no longer a requirement of the
+loader. After editing the plugin,
 re-run `bun test` + `node eval/smoke.mjs`, re-copy, and restart opencode.
 
 Because the tested file and the running file are different files,
