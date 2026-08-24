@@ -31,43 +31,55 @@ Verdicts depend on the served model, so a model change means a fresh shadow peri
 
 ## Install
 
-The classifier goes in `~/.config/opencode/opencode.json`:
+**This is not on npm yet.** Install it by path today; the package name form below is what
+it becomes once published, and it is worth knowing which of the two halves that will
+actually simplify.
+
+Clone the repo and point opencode at the file:
+
+```sh
+mkdir -p ~/.config/opencode/local-classifier
+cp packages/local-classifier/{local-classifier.js,local-classifier-tui.tsx,tui-view.js} \
+   ~/.config/opencode/local-classifier/
+```
+
+```json
+{ "plugin": ["file:///Users/<you>/.config/opencode/local-classifier/local-classifier.js"] }
+```
+
+Once it is published, that entry becomes the package name and the copy goes away for the
+classifier:
 
 ```json
 { "plugin": ["opencode-local-classifier"] }
 ```
 
-That is the whole install for the classifier itself.
+Do not write that line before the package exists. opencode installs an npm plugin on first
+use and a name it cannot resolve fails quietly — no error in any log, just a plugin that
+never loads.
 
-The status box under the prompt is a **TUI plugin**, which is a different kind, read from a
-different file — and on opencode 1.18.20 the TUI loader does not resolve npm package names,
-only paths. Measured, not assumed: the same `.tsx` paints when addressed by a path and
-paints nothing when addressed by the package name. So the box needs one copy:
-
-```sh
-mkdir -p ~/.config/opencode/local-classifier
-cp ~/.cache/opencode/packages/opencode-local-classifier/node_modules/opencode-local-classifier/{local-classifier-tui.tsx,tui-view.js} \
-   ~/.config/opencode/local-classifier/
-```
-
-and then in `~/.config/opencode/tui.json` — a **different file** from `opencode.json`:
+The status box under the prompt is a **TUI plugin**, a different kind read from a different
+file. The copy above already put its two files in place; it just needs registering in
+`~/.config/opencode/tui.json`:
 
 ```json
 { "plugin": ["file:///Users/<you>/.config/opencode/local-classifier/local-classifier-tui.tsx"] }
 ```
 
-Both files are needed: the `.tsx` draws, and it imports its words from `tui-view.js` next to
-it. You can point `tui.json` straight into the cache directory above and skip the copy
-entirely — that works — but the cache path is keyed on the spec string and is not a stable
-address to write into a config file.
+Both files matter: the `.tsx` draws, and it imports its words from `tui-view.js` next to it.
+
+Publishing will not simplify this half. On opencode 1.18.20 the TUI loader resolves paths
+but not package names — measured, not assumed: the same `.tsx` paints when addressed by a
+path and paints nothing when addressed by the package name. So the box stays a copied file
+until that changes upstream.
 
 The classifier works without any of this. Skipping the box costs you the persistent display;
 the toasts still explain each auto-approval.
 
-Note that opencode installs an npm plugin once and then never re-checks it: the cache is
-keyed on the literal spec string, so a bare name is fetched on first use and not refreshed
-afterwards. To move to a new version, pin it — `"opencode-local-classifier@0.2.0"` — which
-changes the spec and therefore the cache key.
+One thing to know for when the npm form does apply: opencode installs a plugin package once
+and then never re-checks it, keyed on the literal spec string. A bare name is fetched on
+first use and not refreshed, so moving to a new version means pinning it —
+`"opencode-local-classifier@0.2.0"` — which changes the spec and therefore the cache key.
 
 ## Lifecycle
 

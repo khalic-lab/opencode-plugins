@@ -121,11 +121,16 @@ plugin module as a factory, and one non-function export can poison an entire
 plugin load batch ("Plugin export is not a function") — verified at 1.18.10.
 
 The classifier is also packaged as `opencode-local-classifier` in
-`packages/local-classifier/`, whose own README is the user-facing one. From npm
-the classifier installs with `{ "plugin": ["opencode-local-classifier"] }` and
-nothing else — verified by version-marking a packaged copy, installing it into
-opencode's own package cache and running it beside the `file://` install, where
-both initialised and recorded the same permission.
+`packages/local-classifier/`, whose own README is the user-facing one. **It is
+not on npm** — only the individual plugins under `packages/` will ever be
+published, never this workspace — so the install below is still the real one.
+
+Once it is published the classifier becomes
+`{ "plugin": ["opencode-local-classifier"] }` and nothing else. That path is
+already verified: a version-marked copy was installed into opencode's own
+package cache and run beside the `file://` install, where both initialised and
+recorded the same permission. Until then the name resolves to nothing, and an
+unresolvable plugin name fails silently.
 
 The box does not come with it. opencode 1.18.20's TUI loader resolves paths but
 not npm package names, so `eval/tui-e2e.py` passes against a `file://` entry and
