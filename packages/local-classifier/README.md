@@ -20,6 +20,13 @@ The classifier call is deliberately not an opencode session. No ephemeral sessio
 tool-deny maps, no way for the classifier to trigger itself, and the offline eval can replay
 the exact production path with plain HTTP.
 
+The command is sent with the absolute path of your project alongside it, so the classifier
+can tell a write inside your tree from a write to the system. That path is context, not
+consent: a command that discards work with git, deletes sources, truncates a file or reads a
+`.env` is judged the same wherever it points. Scratch files under `/tmp`, `/private/tmp` and
+`/var/tmp` are the one place redirection is approved, since nothing there is anyone's work —
+and only writing them, never running them.
+
 [7006]: https://github.com/anomalyco/opencode/issues/7006
 
 ## Requirements
