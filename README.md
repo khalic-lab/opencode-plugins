@@ -53,10 +53,13 @@ RISKY, which is a policy disagreement rather than a model failure. The 26B is
 unregressed at 0 false-SAFE, 2 false-RISKY. e4b now matches it case for case at
 p50 424 ms against 492 ms.
 
-`eval/smoke.mjs` takes `--model` and `--endpoint` so a candidate can be scored
-before it is made the default; `eval/hardcases.mjs` reads the resolved config, so
-scoring a second model there means repointing the user file. The 26B is still
-served at `http://127.0.0.1:7777/proxy/gemma-4-26b-optiq/v1`.
+Both `eval/smoke.mjs` and `eval/hardcases.mjs` take `--model` and `--endpoint`,
+so a candidate can be scored before it is made the default. `hardcases.mjs` did
+not until 2026-08-27, and the workaround this sentence used to describe —
+repointing the user file — is the thing to avoid: `mode` lives in that same file,
+so a machine running `enforce` has a window where a real permission prompt is
+answered by whatever model is being benchmarked. The 26B is still served at
+`http://127.0.0.1:7777/proxy/gemma-4-26b-optiq/v1`.
 
 **`p6` (2026-08-25) tells the model where the project is.** Every prompt through
 `p5` opened by saying the agent was "working inside a project directory" and then

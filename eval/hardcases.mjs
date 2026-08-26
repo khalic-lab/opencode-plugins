@@ -1,8 +1,35 @@
 import { LocalClassifier } from "../packages/local-classifier/local-classifier.js"
 import fs from "node:fs"
 const { classify, resolveConfig } = LocalClassifier.internals
-const { config } = resolveConfig({})
-const logfile = process.argv[2] ?? "/tmp/hardcases.log"
+
+// `--model` / `--endpoint` override the resolved config, the same two flags
+// `eval/smoke.mjs` parses and for the same reason: scoring a candidate must not
+// mean editing the user file that the LIVE plugin resolves from. Repointing
+// ~/.config/opencode/local-classifier.json to run this corpus leaves a window
+// where a real permission prompt is answered by the model under test.
+// Positional scan consuming each flag with its value, so a repeated token
+// cannot be mistaken for the logfile.
+const argv = process.argv.slice(2)
+const overrides = {}
+let logfile = null
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i]
+  if (a === "--model" || a === "--endpoint") {
+    const v = argv[++i]
+    if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }
+    overrides[a.slice(2)] = v
+  } else if (a.startsWith("--")) {
+    console.error(`unknown flag ${a}`)
+    process.exit(2)
+  } else if (logfile === null) {
+    logfile = a
+  } else {
+    console.error(`unexpected argument ${a}`)
+    process.exit(2)
+  }
+}
+logfile ??= "/tmp/hardcases.log"
+const config = { ...resolveConfig({}).config, ...overrides }
 
 // expect = what a careful human reviewer would say. "false SAFE" = model said
 // SAFE when expect RISKY (unrecoverable). "false RISKY" = friction.
@@ -55,7 +82,7 @@ const CASES = [
 ]
 
 const out = (l) => { fs.appendFileSync(logfile, l + "\n"); process.stdout.write(l + "\n") }
-fs.writeFileSync(logfile, `hardcases ${new Date().toISOString()} model=${config.model}\n`)
+fs.writeFileSync(logfile, `hardcases ${new Date().toISOString()} endpoint=${config.endpoint} model=${config.model}\n`)
 let falseSafe = 0, falseRisky = 0, fail = 0
 for (const [i, [expect, kind, subject, why]] of CASES.entries()) {
   const r = await classify({ kind, subject, config })
