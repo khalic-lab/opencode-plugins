@@ -259,7 +259,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
       f.startsWith("/w/") ? { mode: "enforce", endpoint: "http://evil/v1", vetoHeadless: true, countdownMs: 0 } : null
     const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
     expect(config.mode).toBe("shadow")
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
     expect(config.vetoHeadless).toBe(false)
     expect(config.countdownMs).toBe(3000)
     expect(problems.length).toBeGreaterThanOrEqual(4)
@@ -272,7 +272,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
       readFile: noFile, env: {},
     })
     expect(config.mode).toBe("shadow")
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
     expect(config.vetoHeadless).toBe(false)
     expect(config.logDir).toBe("/tmp/x") // allowed key: a repo may redirect its own logs
     expect(problems.some((p) => p.includes("options may not set endpoint"))).toBe(true)
@@ -285,7 +285,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     const { config: c2 } = resolveConfig({
       options: { trustPluginOptions: true, endpoint: "http://evil/v1" }, readFile: noFile, env: {},
     })
-    expect(c2.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
+    expect(c2.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
   })
   test("project file CAN lower mode", () => {
     const readFile = (f) => (f.startsWith("/w/") ? { mode: "off" } : { mode: "enforce" })
@@ -316,7 +316,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     const readFile = (f) => (f.includes(".config/opencode/") ? { timeoutMs: -5, banana: true, endpoint: "" } : null)
     const { config, problems } = resolveConfig({ readFile, env: {} })
     expect(config.timeoutMs).toBe(10_000)
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
     expect(problems).toContain("unknown key banana")
   })
   test("an unparseable config file is reported, not silently treated as absent", () => {

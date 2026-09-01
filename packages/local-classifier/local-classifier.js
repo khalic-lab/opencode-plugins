@@ -79,30 +79,32 @@ const DEFAULTS = Object.freeze({
   /** "shadow" | "enforce" | "off" */
   mode: "shadow",
   /**
-   * OpenAI-compatible base URL of the local model server. Moved off
-   * gemma-4-e4b on 2026-08-30: qwen38-flash-next-mtplx is the box's default
-   * and the only model kept resident, so classifying against gemma meant
-   * cold-loading 8 GB beside it on the first burst of prompts. Measured on the
-   * five-case smoke set (ls, rm -rf /, force-push, cat, curl|sh): 5/5 agreement
-   * with the gemma-era expectations, ~0.6 s warm per classification.
+   * OpenAI-compatible base URL of the local model server.
    *
-   * That five-case set is UNAMBIGUOUS by construction, so it could not have
-   * exposed what 2026-09-01 did: on a command that makes the model deliberate,
-   * it broke the two-line contract (one `malformed_output`, content `REASON: …`
-   * with no VERDICT line). The cause was p5 having no /tmp carve-out to except
-   * the hard-RISKY `> path` rule, which p6 (below) supplies.
+   * Moved to qwen38-flash-next-mtplx on 2026-08-30 because it was the box's only
+   * resident model, then moved BACK to a dedicated gemma-4-e4b on 2026-09-01. The
+   * qwen endpoint is the model the agent session itself runs on, so the classifier
+   * was sharing one server with the very session that generates the prompts it
+   * classifies: the fixed 1670-token prefix got thrashed and each classification
+   * queued behind the session's own decode. Measured that day: 9228 ms on one ask
+   * and a 10004 ms timeout on the next, against timeoutMs 10_000. Contention
+   * between DIFFERENT models is fine — sharing ONE model was the fault.
    *
-   * Scored properly on 2026-09-01, p6 against this model: smoke 66/66 PASS,
-   * 0 false-SAFE, 0 false-RISKY, 0 classifier failures, p50 1000 ms / p95
-   * 1199 ms against the 3000 ms countdown; hardcases 0 false-SAFE with the
-   * same two policy disagreements (`git clean -fdx`, `sudo -n true`) the
-   * gemma era had. Both runs were made while a real session drove this same
-   * model server — the one hardcases timeout was contention, and that case
-   * returns RISKY 3/3 unloaded.
+   * gemma-4-e4b is `always_on` in mlxctl so it never cold-loads (14.4 s) in front
+   * of a prompt, and its server is single-tenant, so `--prompt-cache-size` is not
+   * fighting anyone. It scored smoke 66/66 PASS and hardcases 0 false-SAFE.
+   *
+   * Nothing beat it, searched 2026-09-01: every smaller Gemma 4 E4B build breaks
+   * Per-Layer Embedding safety (qat-mobile pins the PLE table to 2-bit, 4bit-MAD
+   * to 4-bit under a 6-bit backbone, the plain 4bit/mxfp4/nvfp4 builds have no
+   * per-module overrides at all), and E2B already failed this corpus. The one real
+   * rival is Qwen3.5-4B-OptiQ-4bit — half the size, half the latency, 0 false-SAFE
+   * — held back only by misspelling the keyword as "VERDICK" on one deterministic
+   * case, which fails closed.
    */
-  endpoint: "http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1",
+  endpoint: "http://127.0.0.1:7777/proxy/gemma-4-e4b/v1",
   /** Model id as the local server knows it. */
-  model: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
+  model: "mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit",
   /** Per-classification timeout. Local model — keep it short. */
   timeoutMs: 10_000,
   /** enforce mode: delay before replying so the human can see/beat the prompt. */
