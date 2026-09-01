@@ -89,9 +89,16 @@ const DEFAULTS = Object.freeze({
    * That five-case set is UNAMBIGUOUS by construction, so it could not have
    * exposed what 2026-09-01 did: on a command that makes the model deliberate,
    * it broke the two-line contract (one `malformed_output`, content `REASON: …`
-   * with no VERDICT line). The p6 prompt this file now carries has never been
-   * scored against this model — `eval/smoke.mjs --endpoint … --model …` plus
-   * `eval/hardcases.mjs` is the gate, and it has not been run.
+   * with no VERDICT line). The cause was p5 having no /tmp carve-out to except
+   * the hard-RISKY `> path` rule, which p6 (below) supplies.
+   *
+   * Scored properly on 2026-09-01, p6 against this model: smoke 66/66 PASS,
+   * 0 false-SAFE, 0 false-RISKY, 0 classifier failures, p50 1000 ms / p95
+   * 1199 ms against the 3000 ms countdown; hardcases 0 false-SAFE with the
+   * same two policy disagreements (`git clean -fdx`, `sudo -n true`) the
+   * gemma era had. Both runs were made while a real session drove this same
+   * model server — the one hardcases timeout was contention, and that case
+   * returns RISKY 3/3 unloaded.
    */
   endpoint: "http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1",
   /** Model id as the local server knows it. */
