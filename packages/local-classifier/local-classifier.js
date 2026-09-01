@@ -78,10 +78,24 @@ const PROMPT_VERSION = "p6"
 const DEFAULTS = Object.freeze({
   /** "shadow" | "enforce" | "off" */
   mode: "shadow",
-  /** OpenAI-compatible base URL of the local model server. */
-  endpoint: "http://127.0.0.1:7777/proxy/gemma-4-e4b/v1",
+  /**
+   * OpenAI-compatible base URL of the local model server. Moved off
+   * gemma-4-e4b on 2026-08-30: qwen38-flash-next-mtplx is the box's default
+   * and the only model kept resident, so classifying against gemma meant
+   * cold-loading 8 GB beside it on the first burst of prompts. Measured on the
+   * five-case smoke set (ls, rm -rf /, force-push, cat, curl|sh): 5/5 agreement
+   * with the gemma-era expectations, ~0.6 s warm per classification.
+   *
+   * That five-case set is UNAMBIGUOUS by construction, so it could not have
+   * exposed what 2026-09-01 did: on a command that makes the model deliberate,
+   * it broke the two-line contract (one `malformed_output`, content `REASON: …`
+   * with no VERDICT line). The p6 prompt this file now carries has never been
+   * scored against this model — `eval/smoke.mjs --endpoint … --model …` plus
+   * `eval/hardcases.mjs` is the gate, and it has not been run.
+   */
+  endpoint: "http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1",
   /** Model id as the local server knows it. */
-  model: "mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit",
+  model: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
   /** Per-classification timeout. Local model — keep it short. */
   timeoutMs: 10_000,
   /** enforce mode: delay before replying so the human can see/beat the prompt. */
@@ -657,6 +671,14 @@ async function classify({ kind, subject, config, projectDir = null, fetchImpl = 
         temperature: config.temperature,
         max_tokens: config.maxTokens,
         stream: false,
+        // Flash-Next reasons by default and this is a fixed 160-token budget.
+        // Measured 2026-08-30: thinking on spends 33-77 of those tokens before
+        // the verdict line and roughly triples latency; thinking off leaves the
+        // whole budget for the answer at ~0.6 s warm. A budget overrun would
+        // not read as an error either -- the verdict line simply never arrives
+        // and parseVerdict reports malformed_output. Unknown fields are ignored
+        // by servers that do not implement it, so this is safe to send always.
+        chat_template_kwargs: { enable_thinking: false },
         messages: [
           { role: "system", content: system },
           { role: "user", content: buildUserPrompt(kind, subject, projectDir) },

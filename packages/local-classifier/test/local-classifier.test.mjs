@@ -259,7 +259,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
       f.startsWith("/w/") ? { mode: "enforce", endpoint: "http://evil/v1", vetoHeadless: true, countdownMs: 0 } : null
     const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
     expect(config.mode).toBe("shadow")
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
     expect(config.vetoHeadless).toBe(false)
     expect(config.countdownMs).toBe(3000)
     expect(problems.length).toBeGreaterThanOrEqual(4)
@@ -272,7 +272,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
       readFile: noFile, env: {},
     })
     expect(config.mode).toBe("shadow")
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
     expect(config.vetoHeadless).toBe(false)
     expect(config.logDir).toBe("/tmp/x") // allowed key: a repo may redirect its own logs
     expect(problems.some((p) => p.includes("options may not set endpoint"))).toBe(true)
@@ -285,7 +285,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     const { config: c2 } = resolveConfig({
       options: { trustPluginOptions: true, endpoint: "http://evil/v1" }, readFile: noFile, env: {},
     })
-    expect(c2.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(c2.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
   })
   test("project file CAN lower mode", () => {
     const readFile = (f) => (f.startsWith("/w/") ? { mode: "off" } : { mode: "enforce" })
@@ -316,7 +316,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     const readFile = (f) => (f.includes(".config/opencode/") ? { timeoutMs: -5, banana: true, endpoint: "" } : null)
     const { config, problems } = resolveConfig({ readFile, env: {} })
     expect(config.timeoutMs).toBe(10_000)
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
     expect(problems).toContain("unknown key banana")
   })
   test("an unparseable config file is reported, not silently treated as absent", () => {
@@ -493,6 +493,24 @@ describe("project_dir injection (p6)", () => {
     await classify({ kind: "bash", subject: "mkdir -p /proj/src", config, projectDir: "/proj", fetchImpl })
     expect(sent.messages[1].content).toContain("<project_dir>\n/proj\n</project_dir>")
     expect(sent.messages[0].content).toBe(BASH_SYSTEM_PROMPT)
+  })
+
+  // This flag lived only in the deployed copy for a while and was absent from
+  // the repo, so the tested file and the running file disagreed about whether
+  // the model reasons at all. Flash-Next reasons by default and the token
+  // budget is the answer's, not the thinking's; losing this line again would
+  // not raise an error, it would just start returning verdict-less output.
+  test("classify() disables the chat template's thinking mode on every call", async () => {
+    const seen = []
+    const fetchImpl = async (_url, init) => {
+      seen.push(JSON.parse(init.body))
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: ok" } }] }) }
+    }
+    const config = { ...resolveConfig({}).config, timeoutMs: 1000 }
+    await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    await classify({ kind: "external_directory", subject: "/tmp/x", config, fetchImpl })
+    expect(seen).toHaveLength(2)
+    for (const body of seen) expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
   })
 })
 
