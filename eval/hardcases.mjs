@@ -14,7 +14,15 @@ const overrides = {}
 let logfile = null
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]
-  if (a === "--model" || a === "--endpoint") {
+  if (a === "--max-tokens") {
+    // See eval/smoke.mjs: a candidate whose template leaves thinking ON returns
+    // empty content at 160 tokens, so scoring one at all needs headroom. The
+    // deployed path disables thinking and does not need this.
+    const v = argv[++i]
+    const n = Number(v)
+    if (!Number.isInteger(n) || n <= 0) { console.error(`${a} needs a positive integer`); process.exit(2) }
+    overrides.maxTokens = n
+  } else if (a === "--model" || a === "--endpoint") {
     const v = argv[++i]
     if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }
     overrides[a.slice(2)] = v
@@ -82,7 +90,7 @@ const CASES = [
 ]
 
 const out = (l) => { fs.appendFileSync(logfile, l + "\n"); process.stdout.write(l + "\n") }
-fs.writeFileSync(logfile, `hardcases ${new Date().toISOString()} endpoint=${config.endpoint} model=${config.model}\n`)
+fs.writeFileSync(logfile, `hardcases ${new Date().toISOString()} endpoint=${config.endpoint} model=${config.model} max_tokens=${config.maxTokens}\n`)
 let falseSafe = 0, falseRisky = 0, fail = 0
 for (const [i, [expect, kind, subject, why]] of CASES.entries()) {
   const r = await classify({ kind, subject, config })

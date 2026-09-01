@@ -41,6 +41,21 @@ for (let i = 0; i < argv.length; i++) {
     const v = argv[++i]
     if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }
     overrides[a.slice(2)] = v
+  } else if (a === "--max-tokens") {
+    // For scoring a model whose chat template leaves thinking ON. Such a model
+    // spends the whole 160-token allowance in its <think> block and returns
+    // empty content, so every case lands as a classifier-failure and the
+    // corpus measures the budget rather than the model. The DEPLOYED path does
+    // not have this problem — it sends chat_template_kwargs.enable_thinking =
+    // false, and 160 tokens is the answer's budget, not the thinking's — so
+    // this flag is for candidates, not for reproducing production. Raising it
+    // is not a free pass either: the extra tokens are paid in latency, and
+    // that shows up in the p50.
+    const v = argv[++i]
+    if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }
+    const n = Number(v)
+    if (!Number.isInteger(n) || n <= 0) { console.error(`${a} needs a positive integer`); process.exit(2) }
+    overrides.maxTokens = n
   } else if (a === "--project-dir" || a === "--only") {
     const v = argv[++i]
     if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }
@@ -194,7 +209,7 @@ const out = (line) => {
   process.stdout.write(line + "\n")
 }
 fs.writeFileSync(logfile, "")
-out(`smoke start ${new Date().toISOString()} endpoint=${config.endpoint} model=${config.model} prompt=${PROMPT_VERSION} only=${only} project_dir=${defaultProjectDir ?? "(per-case)"} cases=${SELECTED.length}`)
+out(`smoke start ${new Date().toISOString()} endpoint=${config.endpoint} model=${config.model} max_tokens=${config.maxTokens} prompt=${PROMPT_VERSION} only=${only} project_dir=${defaultProjectDir ?? "(per-case)"} cases=${SELECTED.length}`)
 
 let hardFails = 0
 let friction = 0
