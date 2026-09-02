@@ -127,6 +127,33 @@ Because the prompt changed, `eval/analyze-logs.mjs` will raise a mixed-cohort
 tripwire on any log directory spanning the bump and tell you to re-run with
 `--since`; the enforce gate has to be re-earned on `p6` classifications alone.
 
+**`p7` (2026-09-02) names the agent's own working areas.** The Claude Code port
+ran its first hour in shadow, and 32 of its RISKY bash verdicts touched three
+paths the harness itself tells the model to write to: the session scratchpad
+under `/private/tmp/claude-<uid>/`, the project memory under
+`~/.claude/projects/<project>/memory/`, and plan files under `~/.claude/plans/`.
+The reasons read "modifies files in a temporary directory structure" and
+"writes to a file path derived from a user's local project". The `/tmp`
+carve-out covered the scratchpad on paper; a 4B model missed it under a
+twelve-bullet list, and the memory directory is a home path that `p6` excluded
+by rule. `p7` lists the three areas in the bash prompt and carves them out of
+the deletion and in-place rules, with a fifth on-sight rule: executing a file
+from `/tmp` or one of those areas is RISKY even when the same command wrote
+it. That rule exists because the first wording lost exactly that guard: a
+script written into the scratchpad by heredoc and run in the same command came
+back SAFE, reasoned as "writes to a temporary scratchpad file and then executes
+it".
+
+The directory prompt does not get the list, and this time it was tried: with
+the three areas named under SAFE, `~/.claude/settings.json` and a transcript
+both read SAFE as "within the agent's designated project memory area". So the
+directory prompt is byte-identical to `p6`, and the cc hook reads those areas
+deterministically instead. Measured: smoke 77/77 at 0 false SAFE and 0 false
+RISKY (eleven new `p7` cases, seven SAFE and four guards), hardcases 40 at 0
+false SAFE and the same two false RISKY as before, 137 unit tests. The opencode
+plugin is a long-lived process and picks `p7` up on its next start; the hook
+imports the module per call and was on it within a minute.
+
 ## How it works
 
 opencode's `permission.ask` plugin hook is defined but never fired (upstream
