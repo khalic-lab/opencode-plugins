@@ -53,7 +53,7 @@ import os from "node:os"
 import path from "node:path"
 
 const PLUGIN_NAME = "local-classifier"
-const PLUGIN_VERSION = "0.1.0"
+const PLUGIN_VERSION = "0.2.0"
 /**
  * Bump whenever BASH_SYSTEM_PROMPT / DIRECTORY_SYSTEM_PROMPT change in any
  * way. Logged on every classification line so the analyzer can refuse to
@@ -99,30 +99,36 @@ const DEFAULTS = Object.freeze({
   /**
    * OpenAI-compatible base URL of the local model server.
    *
-   * Moved to qwen38-flash-next-mtplx on 2026-08-30 because it was the box's only
-   * resident model, then moved BACK to a dedicated gemma-4-e4b on 2026-09-01. The
-   * qwen endpoint is the model the agent session itself runs on, so the classifier
-   * was sharing one server with the very session that generates the prompts it
-   * classifies: the fixed 1670-token prefix got thrashed and each classification
-   * queued behind the session's own decode. Measured that day: 9228 ms on one ask
-   * and a 10004 ms timeout on the next, against timeoutMs 10_000. Contention
-   * between DIFFERENT models is fine — sharing ONE model was the fault.
+   * qwen38-flash-next-mtplx again since 2026-09-02: the box's one resident
+   * model. It had been moved OFF this endpoint on 2026-09-01 (a classification
+   * measured 9228 ms and the next timed out at 10 s while the classifier shared
+   * the server with the session it was classifying) to a dedicated gemma-4-e4b,
+   * and that pairing does not fit: Flash-Next peaks at ~95 GB during a full
+   * 131k prefill, gemma serves at ~11.6 GB, and the 128 GB box went to
+   * pressure level 2 with 7-9 GB of swap (co-tenancy stress test, 2026-09-02).
    *
-   * gemma-4-e4b is `always_on` in mlxctl so it never cold-loads (14.4 s) in front
-   * of a prompt, and its server is single-tenant, so `--prompt-cache-size` is not
-   * fighting anyone. It scored smoke 66/66 PASS and hardcases 0 false-SAFE.
+   * Re-measured on the smoke corpus the same day: Flash-Next scores 0
+   * false-SAFE / 0 false-RISKY in every condition, p50 ~1000 ms and p95 ~1800
+   * ms idle or right after a 124k turn, first call ~430 ms warm and ~4 s cold.
+   * The one bad condition is a call landing DURING a 124k-token prefill:
+   * 18-19 of 77 hit the 10 s timeout, because mtplx runs strictly one request
+   * at a time, whole generation, no preemption. That cost is accepted: a
+   * timeout leaves the prompt to the human (enforce) or to the built-in
+   * classifier (the Claude Code hook's cascade posture), never auto-approves.
    *
-   * Nothing beat it, searched 2026-09-01: every smaller Gemma 4 E4B build breaks
-   * Per-Layer Embedding safety (qat-mobile pins the PLE table to 2-bit, 4bit-MAD
-   * to 4-bit under a 6-bit backbone, the plain 4bit/mxfp4/nvfp4 builds have no
-   * per-module overrides at all), and E2B already failed this corpus. The one real
-   * rival is Qwen3.5-4B-OptiQ-4bit — half the size, half the latency, 0 false-SAFE
-   * — held back only by misspelling the keyword as "VERDICK" on one deterministic
-   * case, which fails closed.
+   * What makes the shared model bearable is mtplx's block-prefix restore
+   * (>= 512 matching tokens): the fixed system prompt comes back from the RAM
+   * session bank and only the trailing command tokens are prefilled, so the
+   * warm timer below is what keeps the two prompt entries resident.
+   *
+   * Smaller companions were searched 2026-09-01/02 and none fits: every
+   * smaller Gemma 4 E4B build breaks Per-Layer Embedding safety, E2B failed the
+   * corpus, Qwen3.5-4B misspells the keyword on one deterministic case, and no
+   * lower-bit Flash-Next pack with an MTP head loads in mtplx without a repack.
    */
-  endpoint: "http://127.0.0.1:7777/proxy/gemma-4-e4b/v1",
+  endpoint: "http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1",
   /** Model id as the local server knows it. */
-  model: "mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit",
+  model: "Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed",
   /** Per-classification timeout. Local model — keep it short. */
   timeoutMs: 10_000,
   /** enforce mode: delay before replying so the human can see/beat the prompt. */
@@ -149,9 +155,27 @@ const DEFAULTS = Object.freeze({
   breakerThreshold: 3,
   /** How long the breaker stays open before retrying. */
   breakerCooldownMs: 60_000,
-  /** Sampling for the classifier call. */
+  /**
+   * Sampling for the classifier call. maxTokens must stay ABOVE 48: mtplx
+   * files a request with max_tokens <= 48 and a system prompt other than the
+   * session's as an Open WebUI background task — no prompt-prefix reuse and
+   * HTTP 503 whenever anything else is generating (measured 2026-09-02: a
+   * verdict-only variant capped at 8 tokens failed 46/77 cases that way).
+   */
   maxTokens: 160,
   temperature: 0,
+  /**
+   * Stream the answer and settle on its first line — see classify(). `false`
+   * is the whole-answer call, kept for A/B runs and servers without SSE.
+   */
+  stream: true,
+  /**
+   * Once the verdict line has been handed out, how long the rest of the answer
+   * (the REASON line) may take before the stream is abandoned. Only the log
+   * loses when this fires; the decision was already made. The whole 160-token
+   * budget takes ~2.5 s at Flash-Next's decode rate, so 5 s is not a race.
+   */
+  tailTimeoutMs: 5_000,
   /**
    * How often to re-send a throwaway classification purely to keep the model's
    * cached prompt prefix hot. Warm, a classification prefills ~15 tokens;
@@ -278,7 +302,7 @@ function resolveConfig({ options, worktree, env = process.env, readFile = defaul
   // Field validation — every miss degrades to the default and is reported.
   const out = { ...merged }
   if (!VALID_MODES.has(out.mode)) { problems.push(`invalid mode ${JSON.stringify(out.mode)}`); out.mode = "shadow" }
-  for (const k of ["timeoutMs", "countdownMs", "breakerThreshold", "breakerCooldownMs", "maxTokens", "warmIntervalMs"]) {
+  for (const k of ["timeoutMs", "countdownMs", "breakerThreshold", "breakerCooldownMs", "maxTokens", "warmIntervalMs", "tailTimeoutMs"]) {
     if (!Number.isFinite(out[k]) || out[k] < 0) { problems.push(`invalid ${k}`); out[k] = DEFAULTS[k] }
   }
   // The countdown is the human's window to beat an auto-approval; a config
@@ -290,7 +314,7 @@ function resolveConfig({ options, worktree, env = process.env, readFile = defaul
   for (const k of ["endpoint", "model", "logDir"]) {
     if (typeof out[k] !== "string" || !out[k]) { problems.push(`invalid ${k}`); out[k] = DEFAULTS[k] }
   }
-  for (const k of ["externalDirectory", "vetoHeadless", "trustPluginOptions", "toasts"]) {
+  for (const k of ["externalDirectory", "vetoHeadless", "trustPluginOptions", "toasts", "stream"]) {
     if (typeof out[k] !== "boolean") { problems.push(`invalid ${k}`); out[k] = DEFAULTS[k] }
   }
   return { config: out, sources, problems, modeSource }
@@ -686,16 +710,117 @@ function createBreaker({ threshold, cooldownMs, now = Date.now }) {
 // ---------------------------------------------------------------------------
 // The classifier call: plain OpenAI-compatible chat completion, temperature 0,
 // hard timeout via AbortController, timeout-race gate on the deadline.
-// Returns { verdict, reason, raw, latencyMs, failure } — verdict null on any
-// failure, with `failure` naming which one (for the logs).
+//
+// STREAMED, AND SETTLED ON THE FIRST LINE. The answer is verdict-first
+// ("VERDICT: SAFE", then "REASON: …"), so the decision is complete the moment
+// the first newline arrives, while the reason is still being written. Measured
+// 2026-09-03 on Flash-Next, warm: the verdict line lands ~400 ms after the
+// request and the reason ~450 ms after that — two thirds of every call was
+// spent writing text nothing acts on. The reason is not dropped: the stream
+// keeps being read after the verdict has been handed out, and `rest` resolves
+// with it (or with why it never came) so a caller can log it, show it, or wait
+// for it. RISKY callers do wait: that reason is shown to a human or fed back
+// to the agent, and RISKY is the rare, slow path anyway.
+//
+// Two things the early settle must not weaken:
+//   - parseVerdict's whole-answer discipline. A late line naming the other
+//     verdict ("…actually RISKY") used to fail the call closed. It cannot undo
+//     a decision already handed out, so it is reported instead, as
+//     `contradicted` on the tail. 2359 shadow-logged answers to 2026-09-03
+//     held zero such lines; that is what makes settling early defensible, and
+//     the tail line in the log is where that would stop being true.
+//   - the fail-closed shape. A first line that is not a verdict still reads
+//     the whole answer and fails as malformed_output with the full raw text.
+//
+// Returns { verdict, reason, raw, latencyMs, failure, rest }. `rest` is null
+// once the answer is complete (whole-answer path, a verdict-only answer, any
+// failure) and otherwise a promise of { reason, raw, latencyMs, failure,
+// contradicted } for the remainder. `latencyMs` is time to the DECISION; the
+// tail's latencyMs is time to the end of the answer. `reason` and `raw` on the
+// result are filled in in place when the tail arrives, so a record kept from
+// the early return completes itself; `withReason()` is the same thing awaited.
 // ---------------------------------------------------------------------------
+
+const VERDICT_LINE_RE = /^\s*VERDICT\s*:\s*(SAFE|RISKY)\s*$/i
+
+/** "SAFE" | "RISKY" when `line` is exactly a verdict line, else null. */
+function parseVerdictLine(line) {
+  const m = typeof line === "string" ? line.match(VERDICT_LINE_RE) : null
+  return m ? m[1].toUpperCase() : null
+}
+
+/** The first non-blank line of `text`, once a newline has closed it; else null. */
+function closedFirstLine(text) {
+  const start = text.search(/\S/)
+  if (start < 0) return null
+  const nl = text.indexOf("\n", start)
+  return nl < 0 ? null : text.slice(start, nl)
+}
+
+/** The REASON line's text (second non-blank line), as parseVerdict reads it. */
+function reasonOf(text) {
+  const lines = String(text ?? "").split("\n").filter((l) => l.trim() !== "")
+  return (lines[1]?.match(/^\s*REASON\s*:\s*(.+?)\s*$/i)?.[1] ?? "").slice(0, 500)
+}
+
+/**
+ * Read an OpenAI-style SSE body, appending every content delta to `sink.text`
+ * and calling `onDelta` after each. Resolves at end of stream or `[DONE]`;
+ * rejects on a read error, which is how an abort surfaces.
+ */
+async function readSse(body, sink, onDelta) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) return
+      buffer += decoder.decode(value, { stream: true })
+      let nl
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl).replace(/\r$/, "")
+        buffer = buffer.slice(nl + 1)
+        if (!line.startsWith("data:")) continue
+        const payload = line.slice(5).trim()
+        if (payload === "[DONE]") return
+        let event
+        try { event = JSON.parse(payload) } catch { continue }
+        const delta = event?.choices?.[0]?.delta?.content
+        if (typeof delta === "string" && delta) { sink.text += delta; onDelta() }
+      }
+    }
+  } finally {
+    try { reader.releaseLock() } catch {}
+  }
+}
+
+function failureOf(e, prefix = "") {
+  return e?.name === "AbortError"
+    ? `${prefix}timeout`
+    : `${prefix}${prefix ? "error" : "fetch_error"}:${String(e?.message ?? e).split("\n")[0].slice(0, 200)}`
+}
 
 async function classify({ kind, subject, config, projectDir = null, fetchImpl = fetch, now = Date.now }) {
   const started = now()
   const deadline = started + config.timeoutMs
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), config.timeoutMs)
+  let timer = setTimeout(() => controller.abort(), config.timeoutMs)
+  let handedOff = false // the tail owns `timer` from here on
   const system = kind === "external_directory" ? DIRECTORY_SYSTEM_PROMPT : BASH_SYSTEM_PROMPT
+  const streaming = config.stream !== false
+  const whole = (raw, latencyMs) => {
+    // Timeout-race gate: a response that lands after the deadline is treated
+    // as a timeout even if well-formed — enforce mode must not act on it.
+    if (now() > deadline) {
+      return { verdict: null, reason: null, raw, latencyMs: now() - started, failure: "late_after_deadline", rest: null }
+    }
+    const parsed = parseVerdict(raw)
+    if (!parsed) {
+      return { verdict: null, reason: null, raw, latencyMs, failure: raw ? "malformed_output" : "empty_output", rest: null }
+    }
+    return { verdict: parsed.verdict, reason: parsed.reason, raw, latencyMs, failure: null, rest: null }
+  }
   try {
     const res = await fetchImpl(`${config.endpoint.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
@@ -705,7 +830,7 @@ async function classify({ kind, subject, config, projectDir = null, fetchImpl = 
         model: config.model,
         temperature: config.temperature,
         max_tokens: config.maxTokens,
-        stream: false,
+        stream: streaming,
         // Flash-Next reasons by default and this is a fixed 160-token budget.
         // Measured 2026-08-30: thinking on spends 33-77 of those tokens before
         // the verdict line and roughly triples latency; thinking off leaves the
@@ -722,28 +847,82 @@ async function classify({ kind, subject, config, projectDir = null, fetchImpl = 
     })
     const latencyMs = now() - started
     if (!res.ok) {
-      return { verdict: null, reason: null, raw: null, latencyMs, failure: `http_${res.status}` }
+      return { verdict: null, reason: null, raw: null, latencyMs, failure: `http_${res.status}`, rest: null }
     }
-    const body = await res.json()
-    const raw = body?.choices?.[0]?.message?.content ?? null
-    // Timeout-race gate: a response that lands after the deadline is treated
-    // as a timeout even if well-formed — enforce mode must not act on it.
-    if (now() > deadline) {
-      return { verdict: null, reason: null, raw, latencyMs: now() - started, failure: "late_after_deadline" }
+    const contentType = String(res.headers?.get?.("content-type") ?? "")
+    const sse = streaming && typeof res.body?.getReader === "function" && /text\/event-stream/i.test(contentType)
+    if (!sse) {
+      // Whole-answer path: `stream: false`, or a server that answered JSON.
+      const body = await res.json()
+      return whole(body?.choices?.[0]?.message?.content ?? null, latencyMs)
     }
-    const parsed = parseVerdict(raw)
-    if (!parsed) {
-      return { verdict: null, reason: null, raw, latencyMs, failure: raw ? "malformed_output" : "empty_output" }
+
+    // Streamed: settle `head` the moment the first line is closed, or when the
+    // stream ends first. The pump goes on running either way.
+    const sink = { text: "" }
+    let settleHead = () => {}
+    const head = new Promise((resolve) => { settleHead = resolve })
+    let streamEnded = false
+    let streamError = null
+    const pump = readSse(res.body, sink, () => { if (closedFirstLine(sink.text) !== null) settleHead() })
+      .then(() => { streamEnded = true }, (e) => { streamError = e; streamEnded = true })
+      .finally(() => settleHead())
+    await head
+    const decidedAt = now()
+    const first = closedFirstLine(sink.text) ?? (streamEnded ? sink.text : null)
+    const verdict = parseVerdictLine(first)
+    if (!verdict) {
+      // No verdict on line 1 (or nothing at all): the answer fails closed as
+      // a whole. Read to the end so the log gets the full text.
+      await pump
+      if (streamError && !sink.text) throw streamError
+      return whole(sink.text || null, now() - started)
     }
-    return { verdict: parsed.verdict, reason: parsed.reason, raw, latencyMs, failure: null }
-  } catch (e) {
-    const latencyMs = now() - started
-    const failure = e?.name === "AbortError"
-      ? "timeout"
-      : `fetch_error:${String(e?.message ?? e).split("\n")[0].slice(0, 200)}`
-    return { verdict: null, reason: null, raw: null, latencyMs, failure }
-  } finally {
+    if (streamEnded) {
+      // The whole answer is already here (a verdict-only answer, or a tail
+      // faster than the head): judge it whole, exactly as before.
+      return whole(sink.text, decidedAt - started)
+    }
+    if (decidedAt > deadline) {
+      controller.abort()
+      return { verdict: null, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: "late_after_deadline", rest: null }
+    }
+    // Hand the decision out now; the tail keeps reading under its own clock.
+    handedOff = true
     clearTimeout(timer)
+    timer = setTimeout(() => controller.abort(), config.tailTimeoutMs ?? DEFAULTS.tailTimeoutMs)
+    const result = { verdict, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: null, rest: null }
+    result.rest = pump.then(() => {
+      clearTimeout(timer)
+      const raw = sink.text
+      const tail = { reason: reasonOf(raw), raw, latencyMs: now() - started, failure: null, contradicted: false }
+      if (streamError) {
+        tail.failure = failureOf(streamError, "tail_")
+      } else {
+        const parsed = parseVerdict(raw)
+        tail.contradicted = !parsed || parsed.verdict !== verdict
+        if (parsed) tail.reason = parsed.reason
+      }
+      result.reason = tail.reason
+      result.raw = raw
+      result.tail = tail
+      return tail
+    })
+    return result
+  } catch (e) {
+    return { verdict: null, reason: null, raw: null, latencyMs: now() - started, failure: failureOf(e), rest: null }
+  } finally {
+    if (!handedOff) clearTimeout(timer)
+  }
+}
+
+/** The classification with its tail awaited: reason, full raw text, both latencies. */
+async function withReason(result) {
+  if (!result?.rest) return result
+  const tail = await result.rest
+  return {
+    ...result, reason: tail.reason, raw: tail.raw,
+    fullLatencyMs: tail.latencyMs, tailFailure: tail.failure, contradicted: tail.contradicted,
   }
 }
 
@@ -1033,13 +1212,28 @@ const LocalClassifierPlugin = async (input, options) => {
       breaker.recordSuccess(gen)
       cachePut(cacheKey, result)
     }
+    // A streamed answer is logged twice under one permission id: the decision
+    // now, with what has arrived, and the tail when it lands. The decision
+    // line must not wait for the reason — that wait is the latency this
+    // removes. RISKY does wait: its reason is shown to a human or handed to
+    // the agent, and RISKY is the rare path.
     const logged = log.log("classification", {
       permission_id: permissionId, session_id: sessionID, permission: kind, subject,
       endpoint: config.endpoint, model: config.model, prompt_version: PROMPT_VERSION,
       verdict: result.verdict, reason: result.reason, failure: result.failure,
       latency_ms: result.latencyMs, queue_wait_ms: Math.max(0, Date.now() - queuedAt - result.latencyMs),
-      queue_depth: depthAtEntry, raw_output: truncated(result.raw, 4000), ...extra,
+      queue_depth: depthAtEntry, raw_output: truncated(result.raw, 4000),
+      streamed: Boolean(result.rest), ...extra,
     })
+    if (result.rest) {
+      const tailLogged = result.rest.then((tail) => log.log("classification.tail", {
+        permission_id: permissionId, session_id: sessionID, permission: kind,
+        verdict: result.verdict, reason: tail.reason, failure: tail.failure,
+        latency_ms: tail.latencyMs, contradicted: tail.contradicted,
+        raw_output: truncated(tail.raw, 4000), ...extra,
+      }))
+      if (result.verdict === "RISKY") await tailLogged
+    }
     return { ...result, logged }
   }
 
@@ -1098,6 +1292,8 @@ const LocalClassifierPlugin = async (input, options) => {
       rec.reason = result.reason
       rec.failure = result.failure
       rec.logged = result.logged !== false
+      // A streamed SAFE has no reason yet; the record picks it up on arrival.
+      result.rest?.then((tail) => { rec.reason = tail.reason }, () => {})
     }
 
     // Late label join: if the human (or an auto-answering client) replied
@@ -1188,6 +1384,16 @@ const LocalClassifierPlugin = async (input, options) => {
     // A permission we can no longer observe is one we must not answer: without
     // its `pending` entry the human-won-race guard above is inert for it.
     if (!pending.has(asked.id)) return refuse("lost track of permission (evicted from pending)")
+    // The tail of a streamed answer has had the whole countdown to arrive. An
+    // answer that went on to contradict its own verdict, or never finished,
+    // is not one to auto-approve on: the prompt stays with the human. This is
+    // the one place the early settle can still be taken back, and it costs
+    // nothing here — the countdown was always longer than the tail.
+    if (result.rest) {
+      const tail = await result.rest
+      if (tail.failure) return refuse(`answer incomplete (${tail.failure})`)
+      if (tail.contradicted) return refuse("model contradicted its own verdict")
+    }
     // Write the intent BEFORE the reply leaves, so an approval can never be
     // the thing that has no record. If even this line cannot be written, the
     // prompt stays for the human.
@@ -1667,8 +1873,10 @@ export const LocalClassifier = Object.assign(LocalClassifierPlugin, {
     sanitizeSubject,
     buildUserPrompt,
     parseVerdict,
+    parseVerdictLine,
     createBreaker,
     classify,
+    withReason,
     sendApproval,
     showToast,
     truncated,

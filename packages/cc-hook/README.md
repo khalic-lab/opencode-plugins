@@ -20,7 +20,7 @@ cp com.khalic.cc-classifier-warm.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.khalic.cc-classifier-warm.plist
 
 # 3. verify
-./test/exit-discipline.sh          # 71 checks, needs the model up
+./test/exit-discipline.sh          # 73 checks, needs the model up
 node cc-classifier-hook.mjs --warm # prints e.g. "warm SAFE 942ms"
 ```
 
@@ -182,6 +182,30 @@ recorded `Hook returned 'allow' for Bash, but ask rule/safety check requires
 full permission pipeline`, and headless the call was denied with
 `decision_reason_type: "rule"` — the classifier never ran. So a SAFE verdict
 cannot bypass `git push *`; the ask rules stand.
+
+## The model call runs in a detached worker
+
+`classify()` streams the answer and settles on its first line while the
+`REASON` line is still being written (see the plugin README, "The verdict is
+taken from the first line"). The plugin keeps reading, but this process cannot:
+Claude Code takes the decision from the hook's exit, so the hook has to be gone
+the moment the verdict is known, and a process that is gone can't finish reading
+a stream.
+
+So the request is made by a child in its own process group
+(`cc-classifier-hook.mjs --worker`). It writes exactly one line to its stdout,
+the decision, and never writes there again. The hook decides on that line and
+exits; the child keeps reading, writes the reason to the log as a
+`classification.tail` row under the same `session_id` and `tool_use_id`, and
+exits on its own clock. Node startup for the child costs about 50 ms against
+the ~400 ms of reason-writing it takes off the critical path.
+
+The fail-closed shape is unchanged. Every way the worker can fail to deliver a
+line (spawn error, crash, malformed output, silence) is a classifier failure
+under the posture table, just like a timeout. A RISKY verdict waits for its
+reason before the line is written, since that reason is what the posture hands
+on. `CC_CLASSIFIER_INPROCESS=1` keeps the old in-process call for the eval and
+for debugging; the `via` field on the `classification` row shows which ran.
 
 ## The warm keepalive is not optional
 

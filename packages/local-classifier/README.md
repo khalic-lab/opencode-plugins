@@ -32,7 +32,7 @@ and only writing them, never running them.
 ## Requirements
 
 An OpenAI-compatible `/chat/completions` endpoint on localhost. The shipped default expects
-`mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit` served by mlx, but any endpoint and model work
+`Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed` served by mlx, but any endpoint and model work
 — point `endpoint` and `model` at yours and re-run the eval corpora before trusting it.
 Verdicts depend on the served model, so a model change means a fresh shadow period.
 
@@ -116,9 +116,11 @@ enforce.
 | key | default | notes |
 |---|---|---|
 | `mode` | `"shadow"` | `shadow` / `enforce` / `off` |
-| `endpoint` | `http://127.0.0.1:7777/proxy/gemma-4-e4b/v1` | OpenAI-compatible base URL |
-| `model` | `mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit` | as your server names it |
+| `endpoint` | `http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1` | OpenAI-compatible base URL |
+| `model` | `Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed` | as your server names it |
 | `timeoutMs` | `10000` | per classification, hard abort |
+| `stream` | `true` | settle on the verdict line while the reason is still being written (below) |
+| `tailTimeoutMs` | `5000` | how long the reason may take after the verdict; only the log loses |
 | `countdownMs` | `3000` | enforce only; you can beat it |
 | `externalDirectory` | `true` | also classify external-directory prompts |
 | `toasts` | `true` | enforce only; explain each auto-approval |
@@ -131,6 +133,27 @@ The project file and the plugin options layer are **not** trusted: a repo you cl
 write either, so from those layers only `mode`, `externalDirectory` and `logDir` are
 accepted, and the mode may not be raised. Set `trustPluginOptions: true` in the user file if
 you genuinely configure this through plugin options.
+
+## The verdict is taken from the first line
+
+The answer is verdict-first: `VERDICT: SAFE` on line one, `REASON: …` on line two.
+Because the call streams, the decision is made the moment the first newline arrives,
+while the model is still writing the reason. Measured 2026-09-03 on Flash-Next, warm,
+the verdict line lands about 400 ms in and the reason about 450 ms after that, taking
+roughly half of every call off the critical path. The reason isn't thrown away: the
+stream keeps reading, and it records a second log line, `classification.tail`, under
+the same `permission_id`, with the full text, the full latency, and `contradicted`.
+
+Settling early gives up the guarantee tracked by `contradicted`. The whole-answer parser
+fails closed on an answer that names the other verdict later on. A decision that has
+already been handed out can't be undone, so it's recorded instead. The 2,359 shadow-logged
+answers up to 2026-09-03 held none, and `eval/smoke.mjs` fails the run if one ever appears.
+
+Two places still wait for the reason. A RISKY verdict waits because the human or agent
+reads that reason, and RISKY is the rare, slow path anyway. Enforce auto-approval also
+checks the tail after its countdown and refuses if the answer never finished or contradicted
+itself. The countdown is longer than the tail, so this costs nothing and preserves the
+fail-closed shape on the one path that acts.
 
 ## What it will not do
 

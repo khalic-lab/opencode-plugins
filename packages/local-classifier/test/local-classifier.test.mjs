@@ -11,6 +11,8 @@ const {
   createBreaker,
   resolveConfig,
   classify,
+  withReason,
+  parseVerdictLine,
   sanitizeSubject,
   truncated,
 } = LocalClassifier.internals
@@ -259,7 +261,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
       f.startsWith("/w/") ? { mode: "enforce", endpoint: "http://evil/v1", vetoHeadless: true, countdownMs: 0 } : null
     const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
     expect(config.mode).toBe("shadow")
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
     expect(config.vetoHeadless).toBe(false)
     expect(config.countdownMs).toBe(3000)
     expect(problems.length).toBeGreaterThanOrEqual(4)
@@ -272,7 +274,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
       readFile: noFile, env: {},
     })
     expect(config.mode).toBe("shadow")
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
     expect(config.vetoHeadless).toBe(false)
     expect(config.logDir).toBe("/tmp/x") // allowed key: a repo may redirect its own logs
     expect(problems.some((p) => p.includes("options may not set endpoint"))).toBe(true)
@@ -285,7 +287,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     const { config: c2 } = resolveConfig({
       options: { trustPluginOptions: true, endpoint: "http://evil/v1" }, readFile: noFile, env: {},
     })
-    expect(c2.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(c2.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
   })
   test("project file CAN lower mode", () => {
     const readFile = (f) => (f.startsWith("/w/") ? { mode: "off" } : { mode: "enforce" })
@@ -316,7 +318,7 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     const readFile = (f) => (f.includes(".config/opencode/") ? { timeoutMs: -5, banana: true, endpoint: "" } : null)
     const { config, problems } = resolveConfig({ readFile, env: {} })
     expect(config.timeoutMs).toBe(10_000)
-    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/gemma-4-e4b/v1")
+    expect(config.endpoint).toBe("http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1")
     expect(problems).toContain("unknown key banana")
   })
   test("an unparseable config file is reported, not silently treated as absent", () => {
@@ -552,5 +554,123 @@ describe("temp-file carve-out (p6)", () => {
     const bullet = BASH_SYSTEM_PROMPT.split("\n").find((l) => l.includes("Scratch files under /tmp"))
     expect(bullet).toBeTruthy()
     expect(bullet).toMatch(/RISKY/)
+  })
+})
+
+describe("classify — streamed, settled on the first line", () => {
+  const config = { endpoint: "http://test/v1", model: "m", timeoutMs: 1000, tailTimeoutMs: 200, maxTokens: 160, temperature: 0 }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  /**
+   * An SSE response whose chunks arrive on a schedule of [delayMs, text]:
+   * text null = [DONE], text undefined = the stream errors. `hang` leaves the
+   * stream open after the schedule, so only an abort can end it.
+   */
+  const sse = (schedule, { hang = false } = {}) => async (_url, { signal }) => {
+    const enc = new TextEncoder()
+    const body = new ReadableStream({
+      async start(controller) {
+        const tryDo = (fn) => { try { fn() } catch {} }
+        signal?.addEventListener("abort", () => tryDo(() => { const e = new Error("aborted"); e.name = "AbortError"; controller.error(e) }))
+        for (const [delay, text] of schedule) {
+          await sleep(delay)
+          if (signal?.aborted) return
+          if (text === undefined) return tryDo(() => controller.error(new Error("boom")))
+          if (text === null) { tryDo(() => controller.enqueue(enc.encode("data: [DONE]\n\n"))); break }
+          tryDo(() => controller.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`)))
+        }
+        if (!hang) tryDo(() => controller.close())
+      },
+    })
+    return { ok: true, status: 200, headers: new Headers({ "content-type": "text/event-stream" }), body }
+  }
+
+  test("the verdict is handed out before the reason arrives, and the reason follows", async () => {
+    const t0 = Date.now()
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"], [150, "REASON: read-only"], [0, null]]) })
+    expect(r.verdict).toBe("SAFE")
+    expect(r.failure).toBeNull()
+    expect(Date.now() - t0).toBeLessThan(120)
+    expect(r.reason).toBeNull()
+    expect(r.rest).toBeInstanceOf(Promise)
+    const tail = await r.rest
+    expect(tail.reason).toBe("read-only")
+    expect(tail.contradicted).toBe(false)
+    expect(tail.failure).toBeNull()
+    expect(tail.latencyMs).toBeGreaterThanOrEqual(140)
+    expect(r.reason).toBe("read-only") // filled in in place
+    expect(r.raw).toBe("VERDICT: SAFE\nREASON: read-only")
+  })
+  test("withReason merges the tail", async () => {
+    const r = await withReason(await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: RISKY\n"], [20, "REASON: deletes"], [0, null]]) }))
+    expect(r.verdict).toBe("RISKY")
+    expect(r.reason).toBe("deletes")
+    expect(r.fullLatencyMs).toBeGreaterThanOrEqual(r.latencyMs)
+    expect(r.contradicted).toBe(false)
+  })
+  test("a late reversal is reported, not obeyed", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\nREASON: fine\n"], [10, "Actually this is RISKY"], [0, null]]) })
+    expect(r.verdict).toBe("SAFE")
+    const tail = await r.rest
+    expect(tail.contradicted).toBe(true)
+    expect(tail.reason).toBe("fine")
+    expect(tail.failure).toBeNull()
+  })
+  test("no verdict on the first line fails closed with the whole text", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "I think this is fine\n"], [10, "VERDICT: SAFE"], [0, null]]) })
+    expect(r.verdict).toBeNull()
+    expect(r.failure).toBe("malformed_output")
+    expect(r.raw).toBe("I think this is fine\nVERDICT: SAFE")
+    expect(r.rest).toBeNull()
+  })
+  test("a verdict-only answer settles whole", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: RISKY"], [0, null]]) })
+    expect(r.verdict).toBe("RISKY")
+    expect(r.reason).toBe("")
+    expect(r.rest).toBeNull()
+  })
+  test("an empty stream is empty_output", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, null]]) })
+    expect(r.verdict).toBeNull()
+    expect(r.failure).toBe("empty_output")
+  })
+  test("a tail that never ends is abandoned on its own clock; the verdict stands", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"]], { hang: true }) })
+    expect(r.verdict).toBe("SAFE")
+    const tail = await r.rest
+    expect(tail.failure).toBe("tail_timeout")
+    expect(tail.raw).toBe("VERDICT: SAFE\n")
+    expect(tail.contradicted).toBe(false)
+    expect(r.reason).toBe("")
+  })
+  test("a stream error after the verdict is a tail failure, not a lost decision", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"], [10, undefined]]) })
+    expect(r.verdict).toBe("SAFE")
+    const tail = await r.rest
+    expect(tail.failure).toMatch(/^tail_error:/)
+  })
+  test("nothing before the deadline is a timeout", async () => {
+    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, timeoutMs: 40 }, fetchImpl: sse([[500, "VERDICT: SAFE\n"], [0, null]]) })
+    expect(r.verdict).toBeNull()
+    expect(r.failure).toBe("timeout")
+  })
+  test("the request asks for a stream unless stream: false", async () => {
+    const seen = []
+    const capture = (content) => async (_url, init) => {
+      seen.push(JSON.parse(init.body).stream)
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content } }] }) }
+    }
+    const a = await classify({ kind: "bash", subject: "ls", config, fetchImpl: capture("VERDICT: SAFE\nREASON: x") })
+    const b = await classify({ kind: "bash", subject: "ls", config: { ...config, stream: false }, fetchImpl: capture("VERDICT: SAFE\nREASON: x") })
+    expect(seen).toEqual([true, false])
+    // A JSON answer to a streaming request is still read whole.
+    expect(a.verdict).toBe("SAFE"); expect(a.reason).toBe("x"); expect(a.rest).toBeNull()
+    expect(b.verdict).toBe("SAFE"); expect(b.rest).toBeNull()
+  })
+  test("parseVerdictLine accepts exactly a verdict line", () => {
+    expect(parseVerdictLine("VERDICT: SAFE")).toBe("SAFE")
+    expect(parseVerdictLine("  verdict: risky ")).toBe("RISKY")
+    expect(parseVerdictLine("VERDICT: SAFE because")).toBeNull()
+    expect(parseVerdictLine("REASON: x")).toBeNull()
+    expect(parseVerdictLine(null)).toBeNull()
   })
 })

@@ -76,6 +76,14 @@ say() {
 
 # logcheck <name> <pattern>; lognone <name> <pattern> — over the isolated log.
 LOGDIR="$H/.local/share/cc-local-classifier/logs"
+# The model call runs in a detached worker that outlives the hook and writes
+# the answer's tail to the log ~0.5 s after the hook has exited. Anything that
+# clears or reads the log has to let the workers of the calls before it land
+# first, or a tail row from an earlier (enforce) case turns up in a later
+# (shadow) section's log.
+settle_workers() {
+  for _ in $(seq 1 100); do pgrep -f -- "$HOOK --worker" >/dev/null || return 0; sleep 0.1; done
+}
 logcheck() {
   if cat "$LOGDIR"/events-*.jsonl 2>/dev/null | grep -q -- "$2"; then
     PASS=$((PASS+1)); printf 'ok   %-44s\n' "$1"
@@ -306,6 +314,7 @@ echo "== the log says what happened, in the hook's own mode =="
 # The opencode file says enforce, the hook is in shadow. Until 0.2.0 every
 # shadow row logged mode:"enforce", because the logger took its mode from the
 # opencode config. This is the regression test for that.
+settle_workers
 rm -rf "$LOGDIR"
 echo '{"mode":"enforce"}' > "$H/.config/opencode/local-classifier.json"
 POSTURE=cascade
@@ -313,7 +322,10 @@ say   "shadow over an enforce opencode file"  shadow "$(payload Bash '{"command"
 POSTURE=veto
 say   "...and a would-be deny"                shadow "$(payload Bash '{"command":"rm -rf /Users/x/project/src"}')" silent
 rm -f "$H/.config/opencode/local-classifier.json"
+settle_workers
 logcheck "rows carry mode:shadow"                '"mode":"shadow"'
+logcheck "the worker's tail row landed"          '"event":"classification.tail"'
+lognone  "no tail row contradicts its verdict"   '"contradicted":true'
 lognone  "no row claims mode:enforce"            '"mode":"enforce"'
 logcheck "SAFE under cascade logs would_allow"   '"decided":"would_allow"'
 logcheck "RISKY under veto logs would_deny"      '"decided":"would_deny"'

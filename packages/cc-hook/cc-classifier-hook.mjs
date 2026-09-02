@@ -68,13 +68,14 @@
  * informed than we are.
  */
 
+import { spawn } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const HOOK_NAME = "cc-local-classifier"
-const HOOK_VERSION = "0.2.0"
+const HOOK_VERSION = "0.3.0"
 
 // ---------------------------------------------------------------------------
 // Exit discipline. Only exit 2 denies; everything else approves. These two
@@ -429,7 +430,9 @@ async function warm() {
   const I = LocalClassifier.internals
   const { hook: cfg, classifier } = resolveHookConfig(I, process.env)
   const started = Date.now()
-  const result = await I.classify({ kind: "bash", subject: "true", config: classifier, projectDir: null })
+  // The whole answer, so the warm covers the reason's tokens too.
+  const first = await I.classify({ kind: "bash", subject: "true", config: classifier, projectDir: null })
+  const result = I.withReason ? await I.withReason(first) : first
   I.createLogger({ ...classifier, logDir: cfg.logDir }).log("warm", {
     harness: "claude-code", hook_version: HOOK_VERSION,
     endpoint: classifier.endpoint, model: classifier.model,
@@ -444,6 +447,112 @@ async function readStdin() {
   const chunks = []
   for await (const chunk of process.stdin) chunks.push(chunk)
   return Buffer.concat(chunks).toString("utf8")
+}
+
+// ---------------------------------------------------------------------------
+// The model call runs in a DETACHED WORKER, not in the hook process.
+//
+// classify() streams the answer and settles on its first line, while the
+// REASON line is still being written (~450 ms more on Flash-Next, measured
+// 2026-09-03). The opencode plugin can just keep reading; this process cannot:
+// Claude Code takes the decision from the hook's exit, so the hook has to be
+// gone the moment the verdict is known, and a process that is gone cannot
+// finish reading a stream. So the request is made by a child in its own
+// process group. It writes exactly one line to its stdout — the decision — and
+// never writes there again; the parent decides on that line and exits; the
+// child goes on reading, writes the tail to the log under the same join keys,
+// and exits on its own. Node startup for the child is ~50 ms, against ~400 ms
+// of reason-writing it takes off the critical path.
+//
+// Fail-closed shape is unchanged: any way the worker can fail to deliver a
+// line (spawn error, crash, bad output, silence) is a classifier FAILURE
+// under the posture table, exactly like a timeout. CC_CLASSIFIER_INPROCESS=1
+// keeps the old in-process call for the eval and for debugging.
+// ---------------------------------------------------------------------------
+
+/** The worker side: one classification, decision on stdout, tail in the log. */
+async function worker() {
+  // The parent is gone by the time the tail lands; a closed pipe must not be
+  // what kills the log write.
+  process.stdout.on("error", () => {})
+  const here = path.dirname(fileURLToPath(import.meta.url))
+  const modulePath = process.env.CC_CLASSIFIER_MODULE
+    ?? path.resolve(here, "..", "local-classifier", "local-classifier.js")
+  const { LocalClassifier } = await import(modulePath)
+  const I = LocalClassifier.internals
+  const { hook: cfg, classifier } = resolveHookConfig(I, process.env)
+  // Whatever happens, this process ends: the verdict's clock, the tail's
+  // clock, and a margin for the log write.
+  setTimeout(() => process.exit(0), classifier.timeoutMs + (classifier.tailTimeoutMs ?? 5000) + 2000)
+  const say = (rec) => { try { process.stdout.write(JSON.stringify(rec) + "\n") } catch {} }
+  let job
+  try {
+    job = JSON.parse(await readStdin())
+    if (!job || typeof job.subject !== "string" || typeof job.kind !== "string") throw new Error("bad job")
+  } catch {
+    say({ verdict: null, reason: null, raw: null, failure: "worker_bad_job" })
+    return process.exit(0)
+  }
+  const result = await I.classify({ kind: job.kind, subject: job.subject, config: classifier, projectDir: job.projectDir ?? null })
+  // RISKY waits for its reason: it is what the posture shows to the agent or
+  // leaves in the built-in classifier's lap, and RISKY is the rare path.
+  let latencyMs = result.latencyMs
+  if (result.verdict === "RISKY" && result.rest) latencyMs = (await result.rest).latencyMs
+  say({
+    verdict: result.verdict, reason: result.reason, raw: result.raw,
+    failure: result.failure, latencyMs, streamed: Boolean(result.rest),
+  })
+  if (result.rest) {
+    const tail = await result.rest
+    I.createLogger({ ...classifier, logDir: cfg.logDir }).log("classification.tail", {
+      ...(job.base ?? {}), permission: job.kind,
+      verdict: result.verdict, reason: tail.reason, failure: tail.failure,
+      latency_ms: tail.latencyMs, contradicted: tail.contradicted, raw_output: I.truncated(tail.raw, 4000),
+    })
+  }
+  process.exit(0)
+}
+
+/** The hook side: spawn the worker, take its first line as the classification. */
+function classifyViaWorker({ kind, subject, projectDir, base, classifier }) {
+  return new Promise((resolve) => {
+    const started = Date.now()
+    let settled = false
+    let guard = null
+    const finish = (rec) => {
+      if (settled) return
+      settled = true
+      clearTimeout(guard)
+      resolve({ verdict: null, reason: null, raw: null, failure: null, ...rec, latencyMs: rec.latencyMs ?? Date.now() - started })
+    }
+    let child
+    try {
+      child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--worker"], {
+        detached: true, stdio: ["pipe", "pipe", "ignore"], env: process.env,
+      })
+    } catch (e) {
+      return finish({ failure: `worker_spawn:${String(e?.message ?? e).slice(0, 200)}` })
+    }
+    child.on("error", (e) => finish({ failure: `worker_spawn:${String(e?.message ?? e).slice(0, 200)}` }))
+    child.on("exit", (code) => finish({ failure: `worker_exit_${code}` }))
+    child.unref()
+    let buf = ""
+    child.stdout.setEncoding("utf8")
+    child.stdout.on("data", (chunk) => {
+      buf += chunk
+      const nl = buf.indexOf("\n")
+      if (nl < 0) return
+      let rec
+      try { rec = JSON.parse(buf.slice(0, nl)) } catch { rec = { failure: "worker_bad_output" } }
+      finish(rec)
+    })
+    child.stdout.on("end", () => finish({ failure: "worker_exited" }))
+    // The worker has the classifier's own timeout; this only catches a worker
+    // that never answers at all.
+    guard = setTimeout(() => finish({ failure: "worker_timeout" }), classifier.timeoutMs + 1500)
+    child.stdin.on("error", () => {})
+    child.stdin.end(JSON.stringify({ kind, subject, projectDir, base }) + "\n")
+  })
 }
 
 async function main() {
@@ -558,7 +667,9 @@ async function main() {
       })
       return { verdict: null, failure: "breaker_open" }
     }
-    const result = await I.classify({ kind, subject, config: classifier, projectDir })
+    const result = process.env.CC_CLASSIFIER_INPROCESS === "1"
+      ? await I.withReason(await I.classify({ kind, subject, config: classifier, projectDir }))
+      : await classifyViaWorker({ kind, subject, projectDir, base, classifier })
     const next = breaker.record(Boolean(result.failure))
     if (result.failure && next.openedAt) {
       log.log("breaker.open", { ...base, after_consecutive_failures: next.consecutiveFailures })
@@ -569,6 +680,7 @@ async function main() {
       prompt_version: I.PROMPT_VERSION,
       verdict: result.verdict, reason: result.reason, failure: result.failure,
       latency_ms: result.latencyMs, raw_output: I.truncated(result.raw, 4000),
+      streamed: Boolean(result.streamed), via: process.env.CC_CLASSIFIER_INPROCESS === "1" ? "in-process" : "worker",
     })
     return result
   }
@@ -646,4 +758,5 @@ async function main() {
 }
 
 if (process.argv.includes("--warm")) warm()
+else if (process.argv.includes("--worker")) worker()
 else main()

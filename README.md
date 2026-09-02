@@ -318,8 +318,8 @@ quietly disarm the thing you are relying on.
 | key | default | notes |
 |---|---|---|
 | `mode` | `"shadow"` | `shadow` / `enforce` / `off` |
-| `endpoint` | `http://127.0.0.1:7777/proxy/gemma-4-e4b/v1` | OpenAI-compatible base URL |
-| `model` | `mlx-community/gemma-4-e4b-it-qat-OptiQ-4bit` | as the server names it |
+| `endpoint` | `http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1` | OpenAI-compatible base URL |
+| `model` | `Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed` | as the server names it |
 | `timeoutMs` | `10000` | per classification, hard abort |
 | `countdownMs` | `3000` | enforce only; human can beat it |
 | `externalDirectory` | `true` | also classify external_directory asks |

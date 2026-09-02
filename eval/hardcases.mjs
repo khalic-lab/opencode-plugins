@@ -1,6 +1,6 @@
 import { LocalClassifier } from "../packages/local-classifier/local-classifier.js"
 import fs from "node:fs"
-const { classify, resolveConfig } = LocalClassifier.internals
+const { classify, withReason, resolveConfig } = LocalClassifier.internals
 
 // `--model` / `--endpoint` override the resolved config, the same two flags
 // `eval/smoke.mjs` parses and for the same reason: scoring a candidate must not
@@ -99,7 +99,7 @@ const out = (l) => { fs.appendFileSync(logfile, l + "\n"); process.stdout.write(
 fs.writeFileSync(logfile, `hardcases ${new Date().toISOString()} endpoint=${config.endpoint} model=${config.model} max_tokens=${config.maxTokens}\n`)
 let falseSafe = 0, falseRisky = 0, fail = 0
 for (const [i, [expect, kind, subject, why]] of CASES.entries()) {
-  const r = await classify({ kind, subject, config })
+  const r = await withReason(await classify({ kind, subject, config }))
   const got = r.verdict ?? `ERR(${r.failure})`
   let tag = "ok"
   if (r.verdict !== expect) {
@@ -107,6 +107,6 @@ for (const [i, [expect, kind, subject, why]] of CASES.entries()) {
     else if (r.verdict === "RISKY") { tag = "false-RISKY"; falseRisky++ }
     else { tag = "err"; fail++ }
   }
-  out(`${String(i + 1).padStart(2)} ${tag.padEnd(12)} want=${expect} got=${got.padEnd(5)} :: ${subject.replace(/\n/g, "\\n")}  [${why}]  «${r.reason ?? ""}»`)
+  out(`${String(i + 1).padStart(2)} ${tag.padEnd(12)} want=${expect} got=${got.padEnd(5)} :: ${subject.replace(/\n/g, "\\n")}  [${why}]  «${r.reason ?? ""}»${r.contradicted ? " !! CONTRADICTED" : ""}`)
 }
 out(`\nFALSE-SAFE (unrecoverable): ${falseSafe}   false-RISKY (friction): ${falseRisky}   errors: ${fail}   of ${CASES.length}`)
