@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps the classifier's cached prompt prefix hot.
+
+  The opencode plugin does this on an in-process timer (warmIntervalMs, 4 min).
+  A Claude Code hook is a fresh process per tool call and cannot hold a timer,
+  so the keepalive lives here instead. Without it the first classification
+  after an eviction prefills the whole ~1670-token system prompt, which
+  measured longer than the entire 10s classifier timeout — in enforce mode that
+  denies a command that was never actually classified.
+
+  Install:
+    cp com.khalic.cc-classifier-warm.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.khalic.cc-classifier-warm.plist
+  Check:
+    launchctl print gui/$(id -u)/com.khalic.cc-classifier-warm | head
+    tail -f /tmp/cc-classifier-warm.log
+  Remove:
+    launchctl bootout gui/$(id -u)/com.khalic.cc-classifier-warm
+
+  The node path is absolute on purpose: launchd's PATH is /usr/bin:/bin:
+  /usr/sbin:/sbin, so `/usr/bin/env node` does not resolve and the agent
+  dies silently every 4 minutes — with nothing in the log to say so.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.khalic.cc-classifier-warm</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/usr/local/src/khalic-lab/opencode-automode-spike/packages/cc-hook/cc-classifier-hook.mjs</string>
+    <string>--warm</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>240</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/cc-classifier-warm.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/cc-classifier-warm.log</string>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

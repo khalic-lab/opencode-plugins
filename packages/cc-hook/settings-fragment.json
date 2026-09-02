@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Merge the `hooks` block below into ~/.claude/settings.json.",
+    "",
+    "timeout is 30s ON PURPOSE and must stay well ABOVE the hook's own",
+    "deadlineMs (12s default). The harness timeout fails OPEN — a hook that",
+    "exceeds it is killed with outcome 'cancelled', which never sets .blocked,",
+    "so the tool runs. It must never be the thing that fires. The hook's own",
+    "watchdog fires first and exits 2.",
+    "",
+    "The matcher is an alternation so node is not spawned for WebFetch, Task,",
+    "MCP tools and everything else the classifier does not cover.",
+    "",
+    "Start in shadow (the default): it logs a verdict per call and never",
+    "blocks. Promote with CC_CLASSIFIER_MODE=enforce or by writing",
+    "{\"mode\":\"enforce\"} to ~/.config/cc-local-classifier/config.json.",
+    "",
+    "Write that file BEFORE merging this block: the hook layers its mode on",
+    "top of ~/.config/opencode/local-classifier.json, and if that one says",
+    "enforce, a hook with no file of its own arms in enforce.",
+    "",
+    "The node path is absolute on purpose. A spawn failure fails OPEN, so",
+    "PATH must not be a variable in whether this hook runs at all."
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit|Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/node /usr/local/src/khalic-lab/opencode-automode-spike/packages/cc-hook/cc-classifier-hook.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
