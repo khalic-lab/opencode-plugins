@@ -1,6 +1,6 @@
 # cc-hook — the local classifier as a Claude Code PreToolUse hook
 
-Same classifier as the opencode plugin, same p7 prompts, same corpus. The
+Same classifier as the opencode plugin, same p8 prompts, same corpus. The
 prompts and `classify()` are **imported** from `../local-classifier/local-classifier.js`
 rather than copied, so `eval/smoke.mjs` and `eval/hardcases.mjs` keep measuring
 exactly what this hook runs. Measured 2026-09-02: smoke 66/66 PASS with 0 false-SAFE at p50 395 ms, and
@@ -20,7 +20,8 @@ cp com.khalic.cc-classifier-warm.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.khalic.cc-classifier-warm.plist
 
 # 3. verify
-./test/exit-discipline.sh          # 73 checks, needs the model up
+./test/exit-discipline.sh          # 90 checks, needs the model up
+bun test                           # incl. test/hook-internals.test.mjs, no model needed
 node cc-classifier-hook.mjs --warm # prints e.g. "warm SAFE 942ms"
 ```
 
@@ -246,6 +247,54 @@ concurrently, and several hook processes can read `breaker.json` at
 never reach the threshold, so the breaker never opens and the allow policy never
 engages — each call denies individually instead. The counter is best-effort. It
 does not affect the `"deny"` default, which denies either way.
+
+## One model for everything: busy probe, backoff, detached shadow
+
+Since 2026-09-02 the classifier shares Flash-Next with opencode and nvim, and
+mtplx serves one generation at a time, non-preemptible. The first morning an
+opencode session grew its context from 18k to 82k tokens over 39 requests and
+24 of the hook's 129 calls in that hour timed out — each one holding the tool
+call for the full 10 s to say nothing. Hook 0.4.0 answers that three ways:
+
+- **Busy probe** (`busyPromptTokens`, default 6000; `busyProbeMs`, 400). Before
+  sending, the hook asks `GET <endpoint>/mtplx/flight` what is in flight. A
+  request at or above the threshold means the classifier's turn cannot come
+  inside its timeout, so the hook says nothing *now*: the `classification` row
+  carries `skipped: "busy"` and what it saw, the `action` row a
+  `failure: "busy"`. It is a known-unavailable failure like an open breaker —
+  cascade passes, veto and solo deny unless `breakerPolicy` is `"allow"`. The
+  probe is a shortcut, never a gate: a server without the endpoint, or a probe
+  that fails or exceeds `busyProbeMs`, is not busy — but every `classification`
+  row carries `probe` (`free`, `busy`, `off`, or `unavailable:<why>`), so a
+  probe that silently never works is one grep away. `0` turns it off; any
+  other value below 5000 is refused, because a classifier request of our own
+  is ~3.3–4.4k tokens and a lower threshold would read a sibling hook's call as
+  busy. The launchd `--warm` probes too and skips (exit 0, `skipped: "busy"`)
+  rather than queue a prefill behind the long request every four minutes.
+- **Breaker backoff** (`breakerCooldownMs` 60 s, `breakerMaxCooldownMs` 300 s).
+  At a flat 60 s the breaker re-closed every minute of a 25-minute busy spell
+  and each re-close cost the next three calls 10 s apiece. Now `opens` in
+  `breaker.json` counts re-opens without a success in between and the cooldown
+  doubles with it (60, 120, 240, 300). Any success resets it — including the
+  launchd `--warm`, which now records into the same file, so the breaker closes
+  the moment the model answers again rather than on a timer.
+- **Detached shadow** (`shadowDetached`, default true). Shadow only observes,
+  and blocking a tool call for a verdict nobody acts on was pure latency. The
+  hook now spawns the worker with the whole job, logs one
+  `classification.dispatched` row and exits at once; the worker writes the
+  `classification` row (`via: "worker-detached"`), the breaker state and the
+  `action` row (`would_*`, `detached: true`) under the same join keys. A
+  worker that dies before it can log leaves a dispatched row with no
+  classification row — countable, rather than a call that never happened.
+  `CC_CLASSIFIER_SHADOW_DETACHED=0` or `{"shadowDetached": false}` makes shadow
+  block exactly as enforce would, for measuring end-to-end feel. Enforce is
+  unaffected: it has to wait by definition.
+
+The server side of the same incident is in the daemon's launchd plist: mtplx's
+session bank and allocator cache are capped through `MTPLX_SESSION_BANK_MAX_BYTES`
+and `MTPLX_MLX_CACHE_LIMIT`, because that morning the bank filled to its 23.8 GiB
+plan, resident went 79 → 98 GB, the kernel paged ~25 GB of the model out and a
+2.4k-token prefill ran at a tenth of its speed.
 
 ## Coverage
 

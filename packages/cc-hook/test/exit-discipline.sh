@@ -81,8 +81,10 @@ LOGDIR="$H/.local/share/cc-local-classifier/logs"
 # clears or reads the log has to let the workers of the calls before it land
 # first, or a tail row from an earlier (enforce) case turns up in a later
 # (shadow) section's log.
+# Polls past the worker's own kill timer (timeoutMs + tailTimeoutMs + 2 s,
+# 17 s at the defaults): a slow worker must be waited for, not abandoned.
 settle_workers() {
-  for _ in $(seq 1 100); do pgrep -f -- "$HOOK --worker" >/dev/null || return 0; sleep 0.1; done
+  for _ in $(seq 1 200); do pgrep -f -- "$HOOK --worker" >/dev/null || return 0; sleep 0.1; done
 }
 logcheck() {
   if cat "$LOGDIR"/events-*.jsonl 2>/dev/null | grep -q -- "$2"; then
@@ -309,6 +311,104 @@ openbreaker "$((NOW + 1000000000))"
 say   "future openedAt is not open"        enforce "$(payload Bash '{"command":"git status"}')" allow
 rm -f "$STATE/breaker.json"
 POSTURE=veto
+
+# timed <name> <want-exit> <mode> <stdin> <max-ms> [env KEY=VAL ...]
+# An exit code plus a clock: the busy probe and detached shadow are worth
+# nothing if the hook still takes the model's time to reach them.
+timed() {
+  local name="$1" want="$2" mode="$3" stdin="$4" max="$5" start end rc
+  shift 5
+  start=$(python3 -c 'import time;print(int(time.time()*1000))')
+  printf '%s' "$stdin" | env HOME="$H" CC_CLASSIFIER_MODE="$mode" CC_CLASSIFIER_POSTURE="$POSTURE" "$@" node "$HOOK" >/dev/null 2>&1
+  rc=$?
+  end=$(python3 -c 'import time;print(int(time.time()*1000))')
+  if [ "$rc" = "$want" ] && [ $((end-start)) -le "$max" ]; then
+    PASS=$((PASS+1)); printf 'ok   %-44s exit=%s after %sms\n' "$name" "$rc" "$((end-start))"
+  else
+    FAIL=$((FAIL+1)); printf 'FAIL %-44s exit=%s want=%s after %sms (max %s)\n' "$name" "$rc" "$want" "$((end-start))" "$max"
+  fi
+}
+
+echo "== busy probe: a long request in flight means say nothing NOW, not in 10 s =="
+# A server whose flight list shows a 52k-token request and whose completions
+# endpoint never answers. With the probe on, the hook must never reach the
+# completions call at all.
+python3 -c '
+import http.server, json, time
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        body = json.dumps({"enabled": True, "active": [{"rid": "x", "session_id": "s", "phase": "prefill", "elapsed_s": 3.2, "prompt_tokens": 52000}], "recent": []}).encode()
+        self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_POST(self):
+        time.sleep(60)
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+' > "$TMP/busy.port" &
+busy=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TMP/busy.port" ] && break; python3 -c 'import time;time.sleep(0.1)'; done
+BPORT="$(cat "$TMP/busy.port")"
+settle_workers
+rm -rf "$LOGDIR" "$H/.local/state/cc-local-classifier/breaker.json"
+echo "{\"endpoint\":\"http://127.0.0.1:$BPORT/v1\",\"timeoutMs\":2000}" > "$H/.config/opencode/local-classifier.json"
+POSTURE=cascade
+timed "busy: cascade passes at once"          0 enforce "$(payload Bash '{"command":"git status"}')" 3000
+say   "...silently"                           enforce "$(payload Bash '{"command":"git status"}')" silent
+POSTURE=veto
+timed "busy: veto denies at once"             2 enforce "$(payload Bash '{"command":"git status"}')" 3000
+echo '{"breakerPolicy":"allow"}' > "$H/.config/cc-local-classifier/config.json"
+say   "busy: veto, policy allow says nothing" enforce "$(payload Bash '{"command":"git status"}')" silent
+echo '{}' > "$H/.config/cc-local-classifier/config.json"
+# Probe off: the same server now has to be waited for, and the classifier's
+# own timeout lands — the pre-probe behaviour, still available.
+timed "probe off: waits for the model"        2 enforce "$(payload Bash '{"command":"git status"}')" 6000 CC_CLASSIFIER_BUSY_PROMPT_TOKENS=0
+settle_workers
+logcheck "busy is logged as a skip"           '"skipped":"busy"'
+logcheck "...with the request it saw"         '"prompt_tokens":52000'
+logcheck "busy is its own failure kind"       '"failure":"busy"'
+kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
+rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json"
+
+echo "== detached shadow: the hook is gone before the model answers =="
+# Hermetic: a server whose flight list is empty and whose completions answer
+# is a canned SAFE. This section tests the hook's process shape, not the
+# model's judgement, and a busy real model would turn every row into a busy
+# skip and fail exactly when the feature matters.
+python3 -c '
+import http.server, json
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def _send(self, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
+    def do_GET(self): self._send({"enabled": True, "active": [], "recent": []})
+    def do_POST(self):
+        n = int(self.headers.get("content-length") or 0); self.rfile.read(n)
+        self._send({"choices": [{"message": {"content": "VERDICT: SAFE\nREASON: canned"}}]})
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+' > "$TMP/canned.port" &
+canned=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TMP/canned.port" ] && break; python3 -c 'import time;time.sleep(0.1)'; done
+CPORT="$(cat "$TMP/canned.port")"
+settle_workers
+rm -rf "$LOGDIR"
+echo "{\"endpoint\":\"http://127.0.0.1:$CPORT/v1\",\"timeoutMs\":4000}" > "$H/.config/opencode/local-classifier.json"
+POSTURE=cascade
+timed "shadow exits before the verdict"       0 shadow "$(payload Bash '{"command":"echo detached-probe"}')" 1500
+say   "...and says nothing"                   shadow "$(payload Bash '{"command":"echo detached-probe"}')" silent
+timed "shadow blocks when asked to"           0 shadow "$(payload Bash '{"command":"echo blocking-probe"}')" 6000 CC_CLASSIFIER_SHADOW_DETACHED=0
+settle_workers
+logcheck "parent logs the dispatch"           '"event":"classification.dispatched".*"subject":"echo detached-probe"'
+logcheck "detached row is the worker's"       '"subject":"echo detached-probe".*"via":"worker-detached"'
+logcheck "detached action is would_allow"     '"decided":"would_allow".*"detached":true'
+logcheck "the probe was free, and says so"    '"probe":"free"'
+logcheck "blocking row is the hook's"         '"subject":"echo blocking-probe".*"via":"worker"'
+lognone  "blocking row is not detached"       '"subject":"echo blocking-probe".*"via":"worker-detached"'
+kill "$canned" 2>/dev/null; wait "$canned" 2>/dev/null
+rm -f "$H/.config/opencode/local-classifier.json"
 
 echo "== the log says what happened, in the hook's own mode =="
 # The opencode file says enforce, the hook is in shadow. Until 0.2.0 every
