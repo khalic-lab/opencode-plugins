@@ -154,6 +154,39 @@ false SAFE and the same two false RISKY as before, 137 unit tests. The opencode
 plugin is a long-lived process and picks `p7` up on its next start; the hook
 imports the module per call and was on it within a minute.
 
+**`p8` (2026-09-03) is what the first day on one shared model got wrong.** With
+gemma retired and the classifier on Flash-Next, all 667 live verdicts of the
+first twelve hours were audited against `p7` as written (three finders, each
+adversarially judged). 13 of 152 RISKY and 18 of 521 SAFE contradicted the
+rulebook, and they clustered: a project-relative `tmp/` was read as the `/tmp`
+carve-out eight times out of eight, reads of files under `~/.config` and
+`~/.claude` were called credential access, `git config user.email` and
+`user.signingkey` were called credentials, a python heredoc or `node -e`
+rewriting a project file was cleared while `sed -i` on the same file was not,
+and scripts under the user's own tooling (`~/.config/claude-skills`,
+`~/.assistant`) got the `/tmp` on-sight rule, which the prompt never gave them.
+`p8` adds one sentence for each: `tmp/` inside the project is a project path;
+the credential list is closed and reading a config file is inspection, not
+modification; a script that reads a file and writes it back is an in-place
+editor, with relative paths resolved against a leading `cd`; `launchctl list`
+queries and `launchctl load` changes; and the on-sight rule is scoped to `/tmp`
+and the working areas, the only places the agent could have written a file
+itself — a script elsewhere is judged by what the command does. That last one
+is a judgement call, made because writing into those directories is already
+RISKY on its own. A cold review of that first wording found three holes and
+`p8` closes them in the same day: the credential list is closed over *kinds*
+(`.netrc`, `.npmrc`, `.git-credentials`, `~/.config/gh/hosts.yml` and the like
+stay RISKY wherever they live, so "reading config is inspection" cannot
+declassify a token file); the tooling exemption covers the user's checkouts and
+installed binaries but not a drop directory such as `~/.local/bin`, and never a
+file the same command just wrote there; and a relative path after `cd` is
+judged where it lands, so `../../..` out of the scratchpad is a project edit.
+Sections G and H of `eval/hardcases.mjs` hold the twenty-three regression
+cases. Measured: hardcases 63 at 0 false SAFE and three false RISKY — the two
+long-known ones plus the skill-script case, which the model still calls opaque
+despite the exemption (friction only: under cascade the built-in classifier
+decides); smoke 77/77; battery 90/90; 198 unit tests.
+
 ## How it works
 
 opencode's `permission.ask` plugin hook is defined but never fired (upstream
