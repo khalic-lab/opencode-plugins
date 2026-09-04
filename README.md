@@ -187,6 +187,24 @@ long-known ones plus the skill-script case, which the model still calls opaque
 despite the exemption (friction only: under cascade the built-in classifier
 decides); smoke 77/77; battery 90/90; 198 unit tests.
 
+**`p10` (2026-09-04) is the few-shot rulebook, chosen by ablation.** `p8`'s prose
+had hit its ceiling: on 83 fresh commands every rewording took false SAFE on the
+same ten. `p10` keeps `p9`'s output block and replaces the prose with nine short
+hard-RISKY kinds, a PLACES paragraph and about eighty-five one-line worked
+examples, at roughly the same token count. It was measured rather than argued
+over: 22 variants on 1,710 labelled commands from five months of real traffic,
+split in two halves, plus 210 gold cases, all scored on the verdict token's
+log-probabilities. At the cascade's gate (a SAFE stands only at pSAFE ≥ 0.999)
+every variant is safe, 0 to 4 misses on 87, and the wording only moves coverage;
+removing the examples or the project-directory paragraph buys coverage and misses
+together. The shipped text is v2 plus one PLACES sentence, that a scratch path in
+the command does not vouch for the rest of it: after the rule layer, 1 miss of
+161 residue RISKY on traffic (a merge script run with `--no-verify`) and 0 of 60
+on gold, at 68% and 74% of SAFE commands answered without the second model.
+`bash-rules.mjs` gained two rules from the same data: `op item get` and
+`op document get` beside `op read` (6 of 6 traffic uses labelled RISKY), and
+`--no-verify` on any verb (7 of 8), which closes that last miss.
+
 ## How it works
 
 opencode's `permission.ask` plugin hook is defined but never fired (upstream

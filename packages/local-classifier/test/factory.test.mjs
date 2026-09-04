@@ -110,7 +110,7 @@ describe("the prompt prefix is kept warm", () => {
     await flush(120)
     const prompts = warmed(sent)
     // One per family: a warm bash prefix does nothing for a directory ask.
-    expect(prompts.some((p) => /shell commands/i.test(p))).toBe(true)
+    expect(prompts.some((p) => /shell command/i.test(p))).toBe(true) // p8 said "shell commands", p10 "one shell command"
     expect(prompts.some((p) => /filesystem access/i.test(p))).toBe(true)
     const warm = readLog().filter((l) => l.event === "classifier.warm")
     expect(warm.length).toBe(2)

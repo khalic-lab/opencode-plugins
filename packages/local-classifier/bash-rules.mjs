@@ -676,8 +676,16 @@ function ruleCredentials(seg, cmd, state, ctx) {
   if (verb === "gh" && operands(args)[0]?.v === "auth" && operands(args)[1]?.v === "token") {
     return RISKY("credential-kinds", "`gh auth token` prints the stored GitHub token")
   }
-  if (verb === "op" && operands(args)[0]?.v === "read") {
-    return RISKY("credential-kinds", "`op read` fetches a secret out of 1Password")
+  if (verb === "op") {
+    const ops = operands(args).map((a) => a.v)
+    if (ops[0] === "read") return RISKY("credential-kinds", "`op read` fetches a secret out of 1Password")
+    // `op item get` prints the whole item, passwords included, and `op document
+    // get` the stored file: the same secret as `op read`, spelled differently.
+    // On 1,710 traffic commands 6 of 6 uses were labelled RISKY. `op item list`,
+    // `op vault list`, `op whoami` only name things and stay with the model.
+    if ((ops[0] === "item" || ops[0] === "document") && ops[1] === "get") {
+      return RISKY("credential-kinds", `\`op ${ops[0]} get\` fetches a 1Password item, secrets included`)
+    }
   }
   if (verb === "git") {
     const gargs = gitArgs(args)
@@ -718,6 +726,23 @@ function ruleCredentials(seg, cmd, state, ctx) {
     if (!abs) continue
     const kind = credentialKind(abs)
     if (kind) return RISKY("credential-kinds", `${w.v} — ${kind}; reading it is RISKY wherever it lives`)
+  }
+  return null
+}
+
+/**
+ * R10 hooks-bypassed — not a p10 clause; measured on traffic. `--no-verify`
+ * skips the pre-commit, commit-msg and pre-push hooks, which are the checks a
+ * repository put in the way of exactly the commit being made. The one gate-S
+ * miss p10 left on 1,710 traffic commands was a merge script run with it, at
+ * pSAFE 1.000: the model cannot see inside a script and the flag is the only
+ * signal there is. Matched as an exact word on ANY verb, because the flag
+ * reaches git through wrappers and scripts, never only through `git`. Fires
+ * 8 times on traffic, 7 labelled RISKY.
+ */
+function ruleHooksBypassed(cmd) {
+  if (cmd.args.some((a) => a.v === "--no-verify")) {
+    return RISKY("hooks-bypassed", "`--no-verify` skips the repository's hooks — the checks put in the way of exactly this")
   }
   return null
 }
@@ -1282,6 +1307,7 @@ const RULES = [
   { id: "credential-kinds", fn: (seg, cmd, state, ctx) => ruleCredentials(seg, cmd, state, ctx) },
   { id: "env-dump", fn: (seg, cmd, state, ctx) => ruleEnvDump(seg, cmd, state, ctx) },
   { id: "force-push", fn: (seg, cmd) => ruleForcePush(cmd) },
+  { id: "hooks-bypassed", fn: (seg, cmd) => ruleHooksBypassed(cmd) },
   { id: "git-history", fn: (seg, cmd, state, ctx) => ruleGitHistory(cmd, state, ctx) },
   { id: "privilege-system", fn: (seg, cmd, state, ctx) => rulePrivilegeSystem(cmd, state, ctx) },
   { id: "scratch-execution", fn: (seg, cmd, state, ctx) => ruleScratchExecution(seg, cmd, state, ctx) },

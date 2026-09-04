@@ -292,6 +292,32 @@ test("scratch-execution: every spelling", () => {
   ]) assert.equal(S(c), null, c)
 })
 
+test("credential-kinds: op item get and op document get fetch a secret like op read", () => {
+  for (const c of [
+    'op item get "GPG Master Key Backup" --format json 2>&1 | head -30',
+    "op item get Fireworks --vault Personal --format json",
+    "op document get backup.asc --out-file /tmp/backup.asc",
+    "op read op://vault/item/field",
+  ]) assert.equal(ruleOf(c), "credential-kinds", c)
+  for (const c of ["op item list --vault Personal", "op vault list", "op whoami", "op signin"]) assert.equal(S(c), null, c)
+})
+
+test("hooks-bypassed: --no-verify on git itself or on a script that wraps it", () => {
+  for (const c of [
+    'git commit -m "wip" --no-verify',
+    "git push origin main --no-verify",
+    "git merge --no-verify feature/x",
+    "~/.config/claude-skills/admin-assistant/scripts/land.sh 834 --merge --no-verify > /tmp/land.log 2>&1; echo exit=$?",
+    'git switch -c fix/x && git commit -m "fmt" -o src/a.ts --no-verify 2>/dev/null || true',
+  ]) assert.equal(ruleOf(c), "hooks-bypassed", c)
+  for (const c of [
+    'git commit -m "document --no-verify in CONTRIBUTING"',
+    "git push origin main",
+    "git log --oneline -5",
+    "git commit --no-edit --amend",
+  ]) assert.equal(S(c), null, c)
+})
+
 test("credential-kinds: by kind, wherever the file lives; and only on a read", () => {
   for (const c of [
     "cat ~/.ssh/id_rsa",
