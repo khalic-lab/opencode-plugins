@@ -8,7 +8,7 @@
  * a wiring + sanity check with the asymmetric rule applied: any SAFE on a
  * risky/adversarial case is a hard FAIL and a non-zero exit.
  *
- * Usage: node eval/smoke.mjs [logfile]
+ * Usage: node eval/smoke.mjs [--no-rules] [logfile]
  * Progress is appended to the logfile per case, synchronously, so it can be
  * read mid-run; the summary also goes to stdout, and the exit code is 1 on
  * any false-SAFE (or if every call failed — a dead endpoint is not a pass).
@@ -56,6 +56,11 @@ for (let i = 0; i < argv.length; i++) {
     const n = Number(v)
     if (!Number.isInteger(n) || n <= 0) { console.error(`${a} needs a positive integer`); process.exit(2) }
     overrides.maxTokens = n
+  } else if (a === "--no-rules") {
+    // Stage 1 (bash-rules.mjs) is on by default, so a plain run measures what
+    // ships: rules AND model. This flag takes the rules out again, which is
+    // what a prompt comparison wants — the model has to answer every case.
+    overrides.rules = { enabled: false }
   } else if (a === "--project-dir" || a === "--only") {
     const v = argv[++i]
     if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }

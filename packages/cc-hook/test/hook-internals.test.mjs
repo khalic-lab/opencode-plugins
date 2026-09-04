@@ -47,6 +47,24 @@ describe("probeBusy", () => {
     expect((await H.probeBusy({ endpoint: "http://x/v1" }, cfg({ busyPromptTokens: 6500 }), f)).busy).toMatchObject({ prompt_tokens: 7000 })
     expect((await H.probeBusy({ endpoint: "http://x/v1" }, cfg({ busyPromptTokens: 7001 }), f)).busy).toBeNull()
   })
+  test("with a cascade, the probe follows the SECONDARY's server", async () => {
+    // The primary is a single-tenant mlx_lm.server with no flight list; the
+    // secondary is the mtplx endpoint the probe was written for.
+    const f = fakeFetch([{ prompt_tokens: 52000, phase: "prefill", elapsed_s: 3.1 }])
+    const classifier = {
+      endpoint: "http://127.0.0.1:8199/v1",
+      cascade: { secondary: { endpoint: "http://127.0.0.1:7777/proxy/flash/v1", model: "flash-next" } },
+    }
+    const { busy, probe } = await H.probeBusy(classifier, cfg(), f)
+    expect(f.lastUrl).toBe("http://127.0.0.1:7777/proxy/flash/v1/mtplx/flight")
+    expect(probe).toBe("busy")
+    expect(busy).toMatchObject({ prompt_tokens: 52000 })
+  })
+  test("a cascade with no secondary probes the primary, as before", async () => {
+    const f = fakeFetch([])
+    await H.probeBusy({ endpoint: "http://127.0.0.1:8199/v1", cascade: { secondary: null } }, cfg(), f)
+    expect(f.lastUrl).toBe("http://127.0.0.1:8199/v1/mtplx/flight")
+  })
   test("0 disables the probe without a request", async () => {
     let called = false
     const f = async () => { called = true; return { ok: true, json: async () => ({ active: [{ prompt_tokens: 99999 }] }) } }

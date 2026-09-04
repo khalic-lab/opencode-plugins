@@ -1,6 +1,6 @@
 # cc-hook — the local classifier as a Claude Code PreToolUse hook
 
-Same classifier as the opencode plugin, same p8 prompts, same corpus. The
+Same classifier as the opencode plugin, same prompts, same corpus. The
 prompts and `classify()` are **imported** from `../local-classifier/local-classifier.js`
 rather than copied, so `eval/smoke.mjs` and `eval/hardcases.mjs` keep measuring
 exactly what this hook runs. Measured 2026-09-02: smoke 66/66 PASS with 0 false-SAFE at p50 395 ms, and
