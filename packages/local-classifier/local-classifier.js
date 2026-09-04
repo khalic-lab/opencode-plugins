@@ -41,7 +41,10 @@
  *   6. The whole event hook is wrapped so a plugin bug degrades to stock
  *      opencode prompting, never to a crash or an approval.
  *
- * Zero dependencies. The classifier is a plain fetch to an OpenAI-compatible
+ * Zero third-party dependencies, and one sibling module: bash-rules.mjs, the
+ * deterministic RISKY layer that runs before the model (see `classify`). It
+ * must be copied alongside this file; without it the plugin does not load.
+ * The classifier itself is a plain fetch to an OpenAI-compatible
  * /chat/completions endpoint (the local mlx server), NOT an opencode session:
  * no ephemeral sessions to clean up, no tool-deny maps, no system-prompt
  * transform, no way for the classifier to trigger itself — and the offline
@@ -51,6 +54,8 @@
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
+
+import { judgeBashCommand } from "./bash-rules.mjs"
 
 const PLUGIN_NAME = "local-classifier"
 const PLUGIN_VERSION = "0.2.0"
@@ -192,6 +197,36 @@ const DEFAULTS = Object.freeze({
    * once at startup. 0 disables it.
    */
   warmIntervalMs: 4 * 60_000,
+  /**
+   * STAGE 1. The deterministic RISKY layer in bash-rules.mjs, which runs
+   * before the model on every bash subject. `{ enabled: false }` skips it.
+   *
+   * It only ever asserts RISKY, so it can only ADD asks: on the 83 fresh
+   * commands of 2026-09-04 every prompt design missed the same ten as
+   * false-SAFE and nine were decidable without a model. Default on, because
+   * the direction it can be wrong in is friction.
+   */
+  rules: Object.freeze({ enabled: true }),
+  /**
+   * STAGES 2 and 3. Null (the default) means one model call, exactly as
+   * before. An object turns the single call into a cascade:
+   *
+   *   secondary  {endpoint, model} of a SECOND model that decides whatever the
+   *              primary was not certain about. Omit it and an uncertain SAFE
+   *              becomes RISKY instead — no second opinion, just the ask.
+   *   certain    the pSAFE at or above which the primary's SAFE stands on its
+   *              own. 0.999 = only a perfect score: the 4B's scores sit on a
+   *              coarse grid (1.00, 0.88, 0.78, 0.69 …), so anything lower
+   *              admits a whole rung of the grid rather than a sliver.
+   *   primaryTimeoutMs  the primary's share of `timeoutMs`; the secondary gets
+   *              whatever is left, so the whole cascade still fits one budget.
+   *
+   * The primary is asked non-streaming with logprobs (mlx_lm drops logprobs
+   * from streamed chunks, measured 2026-09-04); the secondary is asked the
+   * ordinary streaming way and never sees a logprobs field, because mtplx
+   * answers an HTTP error to one.
+   */
+  cascade: null,
   /** Where JSONL logs go. */
   logDir: path.join(os.homedir(), ".local", "share", "opencode-local-classifier", "logs"),
   /**
@@ -233,6 +268,20 @@ const MODE_RANK = { off: 0, shadow: 1, enforce: 2 }
  */
 const TOAST_PROBE_DELAY_MS = 8_000
 
+/**
+ * `rules` and `cascade` are deliberately absent from this set, in both
+ * directions:
+ *   - `cascade.secondary` names an ENDPOINT and a MODEL. A repo that could add
+ *     one would be choosing the server that decides every command the primary
+ *     was unsure about — the same escalation `endpoint` and `model` are kept
+ *     out for, one level deeper. `cascade.certain: 0` is the same hole spelled
+ *     differently: it makes every SAFE certain and the second opinion never
+ *     happens.
+ *   - `rules: { enabled: false }` removes the deterministic asks. A layer that
+ *     may only lower the mode must not be able to switch the rules off either.
+ * Both are settable from the USER file (which a cloned repo cannot write) and
+ * from trusted plugin options.
+ */
 const UNTRUSTED_ALLOWED_KEYS = new Set(["mode", "externalDirectory", "logDir"])
 
 /**
@@ -321,10 +370,64 @@ function resolveConfig({ options, worktree, env = process.env, readFile = defaul
   for (const k of ["endpoint", "model", "logDir"]) {
     if (typeof out[k] !== "string" || !out[k]) { problems.push(`invalid ${k}`); out[k] = DEFAULTS[k] }
   }
+  // `rules` and `cascade` are OBJECTS, and a config layer replaces one whole
+  // — there is no deep merge — so a user file that sets `cascade.secondary`
+  // alone arrives with no `certain` and no `primaryTimeoutMs`. Both are
+  // rebuilt here field by field from what survived, so a partial block is a
+  // complete one by the time anything reads it, and `config.cascade.certain`
+  // is never undefined at the comparison that decides a SAFE.
+  out.rules = { enabled: readRules(out.rules, problems) }
+  out.cascade = readCascade(out.cascade, problems)
   for (const k of ["externalDirectory", "vetoHeadless", "trustPluginOptions", "toasts", "stream"]) {
     if (typeof out[k] !== "boolean") { problems.push(`invalid ${k}`); out[k] = DEFAULTS[k] }
   }
   return { config: out, sources, problems, modeSource }
+}
+
+/** Defaults for the fields inside a `cascade` block; see DEFAULTS.cascade. */
+const CASCADE_DEFAULTS = Object.freeze({ certain: 0.999, primaryTimeoutMs: 4_000 })
+
+/** `rules.enabled`: only an explicit `false` turns the layer off. */
+function readRules(value, problems) {
+  if (value === null || value === undefined) return true
+  if (typeof value !== "object") { problems.push(`invalid rules ${JSON.stringify(value)}`); return true }
+  if (value.enabled === undefined) return true
+  if (typeof value.enabled !== "boolean") { problems.push(`invalid rules.enabled`); return true }
+  return value.enabled
+}
+
+/**
+ * A complete cascade block, or null for "one model call, as before".
+ *
+ * Every miss degrades toward MORE model calls, never fewer: a secondary whose
+ * endpoint or model is not a usable string is dropped rather than half-used
+ * (a request to `undefined/chat/completions` would fail on every command), and
+ * a `certain` outside (0, 1] falls back to the default instead of being taken
+ * literally — `certain: 0` would make every SAFE certain, which is weaker than
+ * having no cascade at all.
+ */
+function readCascade(value, problems) {
+  if (value === null || value === undefined) return null
+  if (typeof value !== "object" || Array.isArray(value)) { problems.push(`invalid cascade`); return null }
+  const out = { secondary: null, ...CASCADE_DEFAULTS }
+  if (value.certain !== undefined) {
+    if (!Number.isFinite(value.certain) || value.certain <= 0 || value.certain > 1) {
+      problems.push(`invalid cascade.certain ${JSON.stringify(value.certain)} (0 < certain <= 1)`)
+    } else out.certain = value.certain
+  }
+  if (value.primaryTimeoutMs !== undefined) {
+    if (!Number.isFinite(value.primaryTimeoutMs) || value.primaryTimeoutMs <= 0) {
+      problems.push(`invalid cascade.primaryTimeoutMs`)
+    } else out.primaryTimeoutMs = value.primaryTimeoutMs
+  }
+  const s = value.secondary
+  if (s !== undefined && s !== null) {
+    const ok = s && typeof s === "object" && typeof s.endpoint === "string" && s.endpoint
+      && typeof s.model === "string" && s.model
+    if (!ok) problems.push(`invalid cascade.secondary; ignored (needs endpoint and model)`)
+    else out.secondary = { endpoint: s.endpoint, model: s.model }
+  }
+  return out
 }
 
 /**
@@ -810,36 +913,91 @@ function failureOf(e, prefix = "") {
     : `${prefix}${prefix ? "error" : "fetch_error"}:${String(e?.message ?? e).split("\n")[0].slice(0, 200)}`
 }
 
-async function classify({ kind, subject, config, projectDir = null, fetchImpl = fetch, now = Date.now }) {
+/**
+ * The probability the model put on SAFE and on RISKY at the verdict token,
+ * from an OpenAI-style `choices[0].logprobs.content`.
+ *
+ * The verdict token is the first non-blank token after the accumulated text
+ * ends with "VERDICT:", because the model spells the keyword across several
+ * tokens and only the position that follows it carries the choice. Both sums
+ * run over that position's `top_logprobs`, matching by PREFIX after stripping
+ * a leading "Ġ"/"▁"/space: the answer is tokenized as "SAFE", "SA"+"FE" or
+ * "R"+"ISKY" depending on the sampler, so "starts with SA" and "starts with R"
+ * are the only stable tests. The sums are over the top 8 alternatives only —
+ * they are not a distribution and pRisky has been measured at 1.0000033, so
+ * never treat them as summing to one.
+ *
+ * Missing, malformed or absent logprobs give {null, null}, which reads as "not
+ * certain" everywhere and sends the command on to the next stage.
+ */
+function verdictConfidence(content) {
+  const toks = Array.isArray(content) ? content : null
+  if (!toks) return { pSafe: null, pRisky: null }
+  let acc = ""
+  let vi = -1
+  for (let k = 0; k < toks.length; k++) {
+    const t = typeof toks[k]?.token === "string" ? toks[k].token : ""
+    if (/VERDICT\s*:\s*$/i.test(acc) && t.trim() !== "") { vi = k; break }
+    acc += t
+  }
+  const tl = vi >= 0 && Array.isArray(toks[vi]?.top_logprobs) ? toks[vi].top_logprobs : null
+  if (!tl) return { pSafe: null, pRisky: null }
+  const norm = (s) => String(s ?? "").replace(/^[\u0120\u2581\s]+/, "").toUpperCase()
+  const p = (pred) => tl.reduce((a, t) => (pred(norm(t?.token)) && Number.isFinite(t?.logprob) ? a + Math.exp(t.logprob) : a), 0)
+  return { pSafe: p((t) => t.startsWith("SA")), pRisky: p((t) => t.startsWith("R")) }
+}
+
+/**
+ * ONE model call. `classify` below is what everything else calls; this is the
+ * stage it runs one, two or three times.
+ *
+ * The overrides are what a cascade stage varies: which server answers, how
+ * long it may take, whether the answer is streamed, and whether logprobs are
+ * asked for. Everything else — the prompts, the parser, the timeout-race gate,
+ * the streamed first-line settle — is identical for every stage, so a verdict
+ * means the same thing whichever model produced it.
+ */
+async function classifyOnce({
+  kind, subject, config, projectDir = null, fetchImpl = fetch, now = Date.now,
+  endpoint = config.endpoint, model = config.model,
+  timeoutMs = config.timeoutMs, streaming = config.stream !== false, logprobs = false,
+}) {
   const started = now()
-  const deadline = started + config.timeoutMs
+  const deadline = started + timeoutMs
   const controller = new AbortController()
-  let timer = setTimeout(() => controller.abort(), config.timeoutMs)
+  let timer = setTimeout(() => controller.abort(), timeoutMs)
   let handedOff = false // the tail owns `timer` from here on
   const system = kind === "external_directory" ? DIRECTORY_SYSTEM_PROMPT : BASH_SYSTEM_PROMPT
-  const streaming = config.stream !== false
+  // Filled in on the whole-answer path when logprobs were asked for; a
+  // streamed answer never has them (mlx_lm drops them from the chunks).
+  let confidence = { pSafe: null, pRisky: null }
   const whole = (raw, latencyMs) => {
     // Timeout-race gate: a response that lands after the deadline is treated
     // as a timeout even if well-formed — enforce mode must not act on it.
     if (now() > deadline) {
-      return { verdict: null, reason: null, raw, latencyMs: now() - started, failure: "late_after_deadline", rest: null }
+      return { verdict: null, reason: null, raw, latencyMs: now() - started, failure: "late_after_deadline", rest: null, ...confidence }
     }
     const parsed = parseVerdict(raw)
     if (!parsed) {
-      return { verdict: null, reason: null, raw, latencyMs, failure: raw ? "malformed_output" : "empty_output", rest: null }
+      return { verdict: null, reason: null, raw, latencyMs, failure: raw ? "malformed_output" : "empty_output", rest: null, ...confidence }
     }
-    return { verdict: parsed.verdict, reason: parsed.reason, raw, latencyMs, failure: null, rest: null }
+    return { verdict: parsed.verdict, reason: parsed.reason, raw, latencyMs, failure: null, rest: null, ...confidence }
   }
   try {
-    const res = await fetchImpl(`${config.endpoint.replace(/\/$/, "")}/chat/completions`, {
+    const res = await fetchImpl(`${endpoint.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        model: config.model,
+        model,
         temperature: config.temperature,
         max_tokens: config.maxTokens,
         stream: streaming,
+        // Only ever sent to the primary stage, and only there because it is
+        // asked for the whole answer at once. mtplx answers HTTP 400 to a
+        // logprobs field (measured 2026-09-04), so the key must be ABSENT —
+        // not false — on every other call.
+        ...(logprobs ? { logprobs: true, top_logprobs: 8 } : {}),
         // Flash-Next reasons by default and this is a fixed 160-token budget.
         // Measured 2026-08-30: thinking on spends 33-77 of those tokens before
         // the verdict line and roughly triples latency; thinking off leaves the
@@ -856,13 +1014,14 @@ async function classify({ kind, subject, config, projectDir = null, fetchImpl = 
     })
     const latencyMs = now() - started
     if (!res.ok) {
-      return { verdict: null, reason: null, raw: null, latencyMs, failure: `http_${res.status}`, rest: null }
+      return { verdict: null, reason: null, raw: null, latencyMs, failure: `http_${res.status}`, rest: null, ...confidence }
     }
     const contentType = String(res.headers?.get?.("content-type") ?? "")
     const sse = streaming && typeof res.body?.getReader === "function" && /text\/event-stream/i.test(contentType)
     if (!sse) {
       // Whole-answer path: `stream: false`, or a server that answered JSON.
       const body = await res.json()
+      if (logprobs) confidence = verdictConfidence(body?.choices?.[0]?.logprobs?.content)
       return whole(body?.choices?.[0]?.message?.content ?? null, latencyMs)
     }
 
@@ -894,13 +1053,13 @@ async function classify({ kind, subject, config, projectDir = null, fetchImpl = 
     }
     if (decidedAt > deadline) {
       controller.abort()
-      return { verdict: null, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: "late_after_deadline", rest: null }
+      return { verdict: null, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: "late_after_deadline", rest: null, ...confidence }
     }
     // Hand the decision out now; the tail keeps reading under its own clock.
     handedOff = true
     clearTimeout(timer)
     timer = setTimeout(() => controller.abort(), config.tailTimeoutMs ?? DEFAULTS.tailTimeoutMs)
-    const result = { verdict, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: null, rest: null }
+    const result = { verdict, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: null, rest: null, ...confidence }
     result.rest = pump.then(() => {
       clearTimeout(timer)
       const raw = sink.text
@@ -919,10 +1078,145 @@ async function classify({ kind, subject, config, projectDir = null, fetchImpl = 
     })
     return result
   } catch (e) {
-    return { verdict: null, reason: null, raw: null, latencyMs: now() - started, failure: failureOf(e), rest: null }
+    return { verdict: null, reason: null, raw: null, latencyMs: now() - started, failure: failureOf(e), rest: null, ...confidence }
   } finally {
     if (!handedOff) clearTimeout(timer)
   }
+}
+
+// ---------------------------------------------------------------------------
+// THE THREE-STAGE DECISION — the single entry point both harnesses call.
+//
+//   1. RULES     bash-rules.mjs, deterministic, no model, RISKY or no opinion.
+//   2. PRIMARY   the fast local model, asked for the whole answer WITH
+//                logprobs, so its own confidence at the verdict token is
+//                readable. A SAFE it is certain about ends here.
+//   3. SECONDARY a second model, asked the ordinary streaming way, decides
+//                everything else: an uncertain SAFE, a RISKY, a malformed
+//                answer, a timeout, an unreachable primary.
+//
+// Measured on 2026-09-04: the primary's pSAFE lands on a coarse grid, and
+// every false SAFE in the 83-command held-out set sits below the top rung.
+// Only a perfect score therefore ends the cascade, which is why `certain`
+// defaults to 0.999 rather than to something that reads like a probability.
+//
+// The whole cascade shares ONE budget, `timeoutMs`: the primary may take
+// `cascade.primaryTimeoutMs` of it and the secondary gets the remainder, so a
+// caller that waited 10 s for one verdict still waits 10 s for three stages.
+//
+// The result is the deciding stage's own result object, with the stage record
+// stamped onto it — the SAME object, because a streamed result fills its
+// `reason` and `raw` in place when the tail lands and callers hold on to it.
+//
+//   stage      "rules" | "primary" | "secondary"
+//   rule       the rule id when stage 1 decided, else null
+//   primary    { verdict, pSafe, pRisky, latencyMs, failure } | null
+//   secondary  { verdict, latencyMs, failure, endpoint, model } | null
+//
+// `latencyMs` stays the DECISION latency of the deciding stage, which is what
+// the old single-call result meant and what the logs already compare; the
+// stages' own latencies are in the records, and `cascadeMs` is the wall time
+// of all of them together.
+// ---------------------------------------------------------------------------
+
+/** Stamp the stage record onto the deciding stage's own result object. */
+function stamped(result, fields) {
+  result.stage = fields.stage
+  result.rule = fields.rule ?? null
+  result.primary = fields.primary ?? null
+  result.secondary = fields.secondary ?? null
+  if (fields.cascadeMs !== undefined) result.cascadeMs = fields.cascadeMs
+  return result
+}
+
+const snapshotOf = (r) => ({
+  verdict: r.verdict, pSafe: r.pSafe ?? null, pRisky: r.pRisky ?? null,
+  latencyMs: r.latencyMs, failure: r.failure,
+})
+
+async function classify({ kind, subject, config, projectDir = null, fetchImpl = fetch, now = Date.now }) {
+  // STAGE 1. Bash only: bash-rules.mjs reads a shell command, and an
+  // external_directory subject is a list of paths, not one. Timed on the real
+  // clock rather than the injected `now`, which is the seam for the model
+  // deadline: this stage has no request to race and no deadline to miss.
+  if (kind !== "external_directory" && config.rules?.enabled !== false) {
+    const t0 = Date.now()
+    const hit = judgeBashCommand(subject, { projectDir })
+    if (hit) {
+      return stamped({
+        verdict: "RISKY",
+        // The rule id travels in the reason as well as in its own field: the
+        // reason is what a toast and the hook's deny message show, and "which
+        // rule was that" is the first question either one raises.
+        reason: `${hit.why} (rule: ${hit.rule})`,
+        raw: null, latencyMs: Date.now() - t0, failure: null, rest: null,
+        pSafe: null, pRisky: null,
+      }, { stage: "rules", rule: hit.rule, cascadeMs: Date.now() - t0 })
+    }
+  }
+
+  const cascade = config.cascade ?? null
+  if (!cascade) {
+    // No cascade: one call, byte-for-byte the request this sent before —
+    // streamed unless `stream: false`, and with no logprobs field at all.
+    const only = await classifyOnce({ kind, subject, config, projectDir, fetchImpl, now })
+    return stamped(only, { stage: "primary", primary: snapshotOf(only) })
+  }
+
+  const started = now()
+  const deadline = started + config.timeoutMs
+  const certain = cascade.certain ?? CASCADE_DEFAULTS.certain
+
+  // STAGE 2. The whole answer at once, with logprobs: mlx_lm drops logprobs
+  // from streamed chunks (measured 2026-09-04), so `stream: false` here is not
+  // a preference, it is the only shape that carries the confidence.
+  const primaryBudget = Math.min(cascade.primaryTimeoutMs ?? CASCADE_DEFAULTS.primaryTimeoutMs, config.timeoutMs)
+  const p = await classifyOnce({
+    kind, subject, config, projectDir, fetchImpl, now,
+    timeoutMs: primaryBudget, streaming: false, logprobs: true,
+  })
+  const primary = snapshotOf(p)
+  if (p.verdict === "SAFE" && p.pSafe !== null && p.pSafe >= certain) {
+    return stamped(p, { stage: "primary", primary, cascadeMs: now() - started })
+  }
+
+  if (!cascade.secondary) {
+    // No second opinion configured. An uncertain SAFE becomes the ask it
+    // should have been; everything else keeps the primary's own answer,
+    // failures included. A timeout is not a judgement and must never be
+    // reported as one — the posture (or the human) decides what a silent
+    // classifier means, exactly as it does today.
+    if (p.verdict === "SAFE") {
+      p.verdict = "RISKY"
+      p.reason = `primary not certain (pSAFE=${p.pSafe === null ? "none" : p.pSafe.toFixed(2)})`
+      p.rest = null
+    }
+    return stamped(p, { stage: "primary", primary, cascadeMs: now() - started })
+  }
+
+  // STAGE 3. Whatever is left of the budget, the ordinary streaming way, and
+  // never a logprobs field: mtplx answers an HTTP error to one.
+  const remaining = deadline - now()
+  if (remaining <= 0) {
+    return stamped({
+      verdict: null, reason: null, raw: null, latencyMs: now() - started,
+      failure: "secondary_no_budget", rest: null, pSafe: null, pRisky: null,
+    }, {
+      stage: "secondary", primary, cascadeMs: now() - started,
+      secondary: { verdict: null, latencyMs: 0, failure: "secondary_no_budget", ...cascade.secondary },
+    })
+  }
+  const s = await classifyOnce({
+    kind, subject, config, projectDir, fetchImpl, now,
+    endpoint: cascade.secondary.endpoint, model: cascade.secondary.model,
+    timeoutMs: remaining, logprobs: false,
+  })
+  // The secondary decides, and its failure is the cascade's failure: falling
+  // back to the primary's uncertain SAFE is the one thing this must never do.
+  return stamped(s, {
+    stage: "secondary", primary, cascadeMs: now() - started,
+    secondary: { verdict: s.verdict, latencyMs: s.latencyMs, failure: s.failure, ...cascade.secondary },
+  })
 }
 
 /** The classification with its tail awaited: reason, full raw text, both latencies. */
@@ -1202,7 +1496,8 @@ const LocalClassifierPlugin = async (input, options) => {
         permission_id: permissionId, session_id: sessionID, permission: kind, subject,
         endpoint: config.endpoint, model: config.model, prompt_version: PROMPT_VERSION,
         verdict: cached.verdict, reason: cached.reason, failure: cached.failure,
-        latency_ms: null, cached: true, raw_output: truncated(cached.raw, 4000), ...extra,
+        latency_ms: null, cached: true, raw_output: truncated(cached.raw, 4000),
+        ...stageFields(cached), ...extra,
       })
       return { ...cached, cached: true, logged }
     }
@@ -1232,7 +1527,7 @@ const LocalClassifierPlugin = async (input, options) => {
       verdict: result.verdict, reason: result.reason, failure: result.failure,
       latency_ms: result.latencyMs, queue_wait_ms: Math.max(0, Date.now() - queuedAt - result.latencyMs),
       queue_depth: depthAtEntry, raw_output: truncated(result.raw, 4000),
-      streamed: Boolean(result.rest), ...extra,
+      streamed: Boolean(result.rest), ...stageFields(result), ...extra,
     })
     if (result.rest) {
       const tailLogged = result.rest.then((tail) => log.log("classification.tail", {
@@ -1833,6 +2128,27 @@ async function showToast(client, log, { serverUrl, directory, fetchImpl = fetch 
 }
 
 /** Bound a logged value: objects above `max` JSON chars become truncated strings. */
+/**
+ * The cascade's stage record, as log fields. Every existing field on the
+ * `classification` event is untouched — eval/analyze-logs.mjs reads them by
+ * name — and these are added beside them.
+ *
+ * `endpoint` and `model` on the row still name the PRIMARY, because that is
+ * what they have always named and what the analyzer groups verdicts by. When a
+ * secondary decided, the model that actually answered is in `secondary`: the
+ * analyzer's grouping is stage-blind until it is taught about these fields.
+ */
+function stageFields(result) {
+  if (!result || result.stage === undefined) return {}
+  return {
+    stage: result.stage,
+    rule: result.rule ?? null,
+    primary: result.primary ?? null,
+    secondary: result.secondary ?? null,
+    ...(Number.isFinite(result.cascadeMs) ? { cascade_ms: result.cascadeMs } : {}),
+  }
+}
+
 function truncated(value, max) {
   if (value === null || value === undefined) return null
   try {
@@ -1885,10 +2201,15 @@ export const LocalClassifier = Object.assign(LocalClassifierPlugin, {
     parseVerdictLine,
     createBreaker,
     classify,
+    classifyOnce,
+    verdictConfidence,
+    judgeBashCommand,
+    CASCADE_DEFAULTS,
     withReason,
     sendApproval,
     showToast,
     truncated,
+    stageFields,
     collectPaths,
     judgeWritePath,
     isOutside,

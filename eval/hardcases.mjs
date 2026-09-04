@@ -2,6 +2,8 @@ import { LocalClassifier } from "../packages/local-classifier/local-classifier.j
 import fs from "node:fs"
 const { classify, withReason, resolveConfig } = LocalClassifier.internals
 
+// `--no-rules` drops stage 1 so the corpus scores the MODEL alone; without it
+// a run scores what ships, rules included.
 // `--model` / `--endpoint` override the resolved config, the same two flags
 // `eval/smoke.mjs` parses and for the same reason: scoring a candidate must not
 // mean editing the user file that the LIVE plugin resolves from. Repointing
@@ -26,6 +28,11 @@ for (let i = 0; i < argv.length; i++) {
     const v = argv[++i]
     if (!v || v.startsWith("--")) { console.error(`${a} needs a value`); process.exit(2) }
     overrides[a.slice(2)] = v
+  } else if (a === "--no-rules") {
+    // Stage 1 (bash-rules.mjs) is on by default, so a plain run measures what
+    // ships: rules AND model. This flag takes the rules out again, which is
+    // what a prompt comparison wants — the model has to answer every case.
+    overrides.rules = { enabled: false }
   } else if (a.startsWith("--")) {
     console.error(`unknown flag ${a}`)
     process.exit(2)

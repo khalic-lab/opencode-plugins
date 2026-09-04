@@ -128,11 +128,62 @@ enforce.
 | `breakerThreshold` / `breakerCooldownMs` | `3` / `60000` | consecutive failures open the breaker |
 | `warmIntervalMs` | `240000` | keeps the model's cached prompt prefix hot; 0 disables |
 | `logDir` | `~/.local/share/opencode-local-classifier/logs` | JSONL, one file per day, `0700`/`0600` |
+| `rules` | `{ "enabled": true }` | stage 1, the deterministic RISKY layer (below) |
+| `cascade` | `null` | stages 2 and 3 (below) |
 
 The project file and the plugin options layer are **not** trusted: a repo you clone can
 write either, so from those layers only `mode`, `externalDirectory` and `logDir` are
 accepted, and the mode may not be raised. Set `trustPluginOptions: true` in the user file if
 you genuinely configure this through plugin options.
+
+`rules` and `cascade` are user-file-only for the same reason, one level deeper:
+`cascade.secondary` names the server that decides every command the primary was unsure
+about, `cascade.certain: 0` would make every SAFE certain, and `rules: { enabled: false }`
+would remove the deterministic asks. None of that may come from a checkout.
+
+## Three stages
+
+Every classification goes through up to three of them, inside one `timeoutMs`.
+
+1. **Rules** — `bash-rules.mjs`, deterministic, no model. It only ever says RISKY, so it can
+   only add asks; a hit ends the decision and names the rule. `rules: { enabled: false }`
+   skips it. Bash only: an external-directory subject is a list of paths, not a command.
+2. **Primary** — `endpoint`/`model`, asked for the whole answer with `logprobs`, so the
+   probability it put on SAFE at the verdict token is readable. A SAFE at or above
+   `cascade.certain` ends the decision.
+3. **Secondary** — `cascade.secondary`, asked the ordinary streaming way, decides everything
+   else: an uncertain SAFE, a RISKY, a malformed answer, an unreachable primary. Its failure
+   is the whole call's failure — the primary's uncertain SAFE is never the fallback.
+
+```json
+{
+  "endpoint": "http://127.0.0.1:8199/v1",
+  "model": "mlx-community/Qwen3.5-4B-OptiQ-4bit",
+  "cascade": {
+    "secondary": {
+      "endpoint": "http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1",
+      "model": "mtplx-flash-next-bare-speed"
+    },
+    "certain": 0.999,
+    "primaryTimeoutMs": 4000
+  }
+}
+```
+
+With no `cascade` block it is one model call, exactly as before: streamed, no logprobs field.
+With a `cascade` that has no `secondary`, an uncertain SAFE becomes RISKY
+(`primary not certain (pSAFE=0.88)`) and a failure stays a failure.
+
+`certain` defaults to `0.999` because the 4B's scores sit on a coarse grid — 1.00, 0.88,
+0.78, 0.69 — so only a perfect score ends the cascade; anything lower admits a whole rung.
+The primary must be asked non-streaming: mlx_lm drops logprobs from streamed chunks. The
+secondary must never be sent a `logprobs` field: mtplx answers an HTTP error to one.
+
+Each classification log line gains `stage` (`rules`/`primary`/`secondary`), `rule`,
+`primary: {verdict, pSafe, pRisky, latencyMs, failure}`, `secondary: {verdict, latencyMs,
+failure, endpoint, model}` and `cascade_ms`. Every field that was there before is unchanged.
+`endpoint` and `model` on the line still name the primary, so `eval/analyze-logs.mjs` groups
+verdicts by a model that may not be the one that answered.
 
 ## The verdict is taken from the first line
 

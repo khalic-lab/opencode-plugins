@@ -503,7 +503,19 @@ function loadBreaker(cfg, now = Date.now) {
  */
 async function probeBusy(classifier, cfg, fetchImpl = fetch) {
   if (!(cfg.busyPromptTokens > 0)) return { busy: null, probe: "off" }
-  const url = `${String(classifier.endpoint ?? "").replace(/\/+$/, "")}/mtplx/flight`
+  // With a cascade configured this asks about the SECONDARY's server, not the
+  // primary's. The probe exists because mtplx serves one generation at a time
+  // and a classifier call queued behind a long turn cannot win inside its
+  // timeout — and mtplx is where the secondary runs. The primary is a
+  // single-tenant mlx_lm.server with no flight list at all, so probing it
+  // would answer "unavailable:http_404" forever and never skip anything.
+  //
+  // A busy secondary skips the whole cascade, including a primary that might
+  // have answered certain-SAFE on its own. That is the conservative reading
+  // and it is deliberate: the stage that decides the hard cases is the one
+  // that has to be available for the answer to mean what it usually means.
+  const target = classifier.cascade?.secondary?.endpoint ?? classifier.endpoint
+  const url = `${String(target ?? "").replace(/\/+$/, "")}/mtplx/flight`
   try {
     const res = await fetchImpl(url, { signal: AbortSignal.timeout(cfg.busyProbeMs) })
     if (!res.ok) return { busy: null, probe: `unavailable:http_${res.status}` }
@@ -572,7 +584,12 @@ function logClassification(log, I, base, kind, subject, classifier, result, via,
     prompt_version: I.PROMPT_VERSION,
     verdict: result.verdict, reason: result.reason, failure: result.failure,
     latency_ms: result.latencyMs, raw_output: I.truncated(result.raw, 4000),
-    streamed: Boolean(result.streamed), via, ...(probe ? { probe } : {}),
+    streamed: Boolean(result.streamed), via,
+    // The cascade's stage record, from whichever process holds the result:
+    // the worker sends these back on its decision line, so a row written here
+    // says the same thing as one written there.
+    ...(I.stageFields ? I.stageFields(result) : {}),
+    ...(probe ? { probe } : {}),
   })
 }
 
@@ -706,6 +723,11 @@ async function worker() {
   say({
     verdict: result.verdict, reason: result.reason, raw: result.raw,
     failure: result.failure, latencyMs, streamed: Boolean(result.rest),
+    // The parent decides and logs on this line alone, so the stage record has
+    // to travel on it too.
+    stage: result.stage ?? null, rule: result.rule ?? null,
+    primary: result.primary ?? null, secondary: result.secondary ?? null,
+    cascadeMs: result.cascadeMs ?? null,
   })
   const log = I.createLogger({ ...classifier, logDir: cfg.logDir })
   if (job.detached) {
