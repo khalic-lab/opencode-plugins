@@ -90,7 +90,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const HOOK_NAME = "cc-local-classifier"
-const HOOK_VERSION = "0.4.0"
+const HOOK_VERSION = "0.5.0"
 
 // ---------------------------------------------------------------------------
 // Exit discipline. Only exit 2 denies; everything else approves. These two

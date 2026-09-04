@@ -58,7 +58,7 @@ import path from "node:path"
 import { judgeBashCommand } from "./bash-rules.mjs"
 
 const PLUGIN_NAME = "local-classifier"
-const PLUGIN_VERSION = "0.2.0"
+const PLUGIN_VERSION = "0.3.0"
 /**
  * Bump whenever BASH_SYSTEM_PROMPT / DIRECTORY_SYSTEM_PROMPT change in any
  * way. Logged on every classification line so the analyzer can refuse to
