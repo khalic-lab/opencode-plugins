@@ -197,3 +197,107 @@ describe("resolveHookConfig — the new keys", () => {
     expect(H.resolveHookConfig(I, env({ CC_CLASSIFIER_BUSY_PROMPT_TOKENS: "5000" })).hook.busyPromptTokens).toBe(5000)
   })
 })
+
+describe("extraRoots", () => {
+  const home = os.homedir()
+
+  test("absolute roots survive and ~ is expanded", () => {
+    const problems = []
+    const out = H.normalizeExtraRoots(["/usr/local/src/khalic-lab/x", "~/code/y"], problems)
+    expect(out).toEqual(["/usr/local/src/khalic-lab/x", path.join(home, "code/y")])
+    expect(problems).toEqual([])
+  })
+
+  // A root at or above HOME, or a system directory, would switch the boundary
+  // rule off for most of the disk. Rejected outright, never clamped.
+  test("over-broad roots are rejected and reported", () => {
+    for (const bad of ["/", home, "~", "/etc", "/usr", path.dirname(home)]) {
+      const problems = []
+      expect(H.normalizeExtraRoots([bad], problems)).toEqual([])
+      expect(problems.length).toBe(1)
+    }
+  })
+
+  test("bad entries drop individually; a non-array is refused whole", () => {
+    const problems = []
+    expect(H.normalizeExtraRoots(["/tmp/ok", "", 7, null], problems)).toEqual(["/tmp/ok"])
+    expect(problems.length).toBe(3)
+    expect(H.normalizeExtraRoots("/tmp/nope", [])).toEqual([])
+    expect(H.normalizeExtraRoots(undefined, [])).toEqual([])
+  })
+
+  test("ccOwnRoot returns a declared root, and prefers it over the built-ins", () => {
+    const root = "/usr/local/src/spike"
+    expect(H.ccOwnRoot(`${root}/packages/a.js`, [root])).toBe(root)
+    expect(H.ccOwnRoot(`${root}/packages/a.js`, [])).toBeNull()
+    expect(H.ccOwnRoot("/usr/local/src/spike-other/a.js", [root])).toBeNull()
+  })
+
+  test("the built-in roots still work with no extras declared", () => {
+    const uid = process.getuid()
+    expect(H.ccOwnRoot(`/tmp/claude-${uid}/x/y.txt`)).toBe(`/tmp/claude-${uid}`)
+    expect(H.ccOwnRoot(path.join(home, ".claude", "plans", "p.md"))).toBe(path.join(home, ".claude", "plans"))
+  })
+
+  test("a declared root does not disable the sensitive-path rules inside it", () => {
+    const I = LocalClassifier.internals
+    const root = "/tmp/declared"
+    expect(I.judgeWritePath(`${root}/.ssh/id_rsa`, root)).not.toBeNull()
+    expect(I.judgeWritePath(`${root}/src/app.js`, root)).toBeNull()
+  })
+})
+
+describe("ask-then-remember", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cc-ask-"))
+  const cfgAsk = (over = {}) => cfg({
+    stateDir: path.join(tmp, "state"),
+    rememberedRootsFile: path.join(tmp, "state", "remembered-roots.json"),
+    outsideProjectAction: "ask",
+    ...over,
+  })
+
+  test("candidateRootFor prefers the enclosing git repo over the file's folder", () => {
+    const repo = path.join(tmp, "repo")
+    fs.mkdirSync(path.join(repo, "a", "b"), { recursive: true })
+    fs.mkdirSync(path.join(repo, ".git"), { recursive: true })
+    expect(H.candidateRootFor(path.join(repo, "a", "b", "f.txt"))).toBe(repo)
+
+    const loose = path.join(tmp, "loose", "deep")
+    fs.mkdirSync(loose, { recursive: true })
+    expect(H.candidateRootFor(path.join(loose, "f.txt"))).toBe(loose)
+  })
+
+  // The whole point of the park/claim pair: only a folder the user was actually
+  // asked about, on a call that actually ran, gets remembered.
+  test("a parked ask is claimed exactly once, by its own tool_use_id", () => {
+    const c = cfgAsk()
+    H.parkAsk(c, "call-1", "/tmp/root-one")
+    expect(H.claimAsk(c, "call-2")).toBeNull()
+    expect(H.claimAsk(c, "call-1")).toBe("/tmp/root-one")
+    expect(H.claimAsk(c, "call-1")).toBeNull()
+  })
+
+  test("an ask nobody approved is never collected", () => {
+    const c = cfgAsk()
+    H.parkAsk(c, "declined", "/tmp/never")
+    expect(H.loadRememberedRoots(c)).not.toContain("/tmp/never")
+  })
+
+  test("remembering is idempotent and readable back", () => {
+    const c = cfgAsk({ rememberedRootsFile: path.join(tmp, "state", "r2.json") })
+    expect(H.rememberRoot(c, "/tmp/remembered").added).toBe(true)
+    expect(H.rememberRoot(c, "/tmp/remembered").added).toBe(false)
+    expect(H.loadRememberedRoots(c)).toEqual(["/tmp/remembered"])
+  })
+
+  test("a remembered root still cannot be over-broad", () => {
+    const c = cfgAsk({ rememberedRootsFile: path.join(tmp, "state", "r3.json") })
+    fs.mkdirSync(path.dirname(c.rememberedRootsFile), { recursive: true })
+    fs.writeFileSync(c.rememberedRootsFile, JSON.stringify({ roots: [os.homedir(), "/", "/tmp/fine"] }))
+    expect(H.loadRememberedRoots(c)).toEqual(["/tmp/fine"])
+  })
+
+  test("outsideProjectAction only accepts deny or ask", () => {
+    expect(H.HOOK_DEFAULTS.outsideProjectAction).toBe("deny")
+  })
+})

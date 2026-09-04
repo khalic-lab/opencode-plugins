@@ -123,6 +123,31 @@ function deny(reason) {
 }
 
 /**
+ * Hand the call to the human. Claude Code renders its own permission prompt and
+ * shows `reason`. Exit 0: unlike deny, this is not a block — the harness is
+ * being asked to ask, and the user's answer decides.
+ *
+ * Used only where a deny would be merely inconvenient rather than protective:
+ * a write whose sole objection is that it sits outside the session's project
+ * directory. A sensitive path still denies outright, because "are you sure?"
+ * is the wrong question about someone's SSH key.
+ */
+function askUser(reason) {
+  if (exiting) return
+  exiting = true
+  try {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "ask",
+        permissionDecisionReason: `[${HOOK_NAME}] ${reason}`,
+      },
+    }) + "\n")
+  } catch {}
+  process.exit(0)
+}
+
+/**
  * Let the call proceed. `decision` null = say nothing and fall through to the
  * built-in classifier (default). "allow" = claim the decision and bypass it.
  */
@@ -250,6 +275,42 @@ const HOOK_DEFAULTS = Object.freeze({
    * must never be the thing that fires.
    */
   deadlineMs: 12_000,
+  /**
+   * Extra directories to treat as project roots, on top of the built-in three
+   * in ccOwnRoot. A target under one of these is judged with that root as its
+   * project: the boundary rule ("outside the project directory") stops firing,
+   * and NOTHING else changes — SENSITIVE_PATH_PATTERNS still apply inside it,
+   * so listing a root cannot unlock an ~/.ssh or a shell profile within it.
+   *
+   * This exists because a session's project is wherever it was started, and
+   * real work spans trees: a session in ~/.config editing the spike repo had
+   * every write denied as external, which is the rule working as specified and
+   * still wrong for the task.
+   *
+   * Read ONLY from ~/.config/<HOOK_NAME>/config.json. resolveHookConfig reads
+   * no project layer by design, so a cloned repo cannot widen its own
+   * boundary — adding a root stays a deliberate act by the user, in a file
+   * only the user writes. `~` is expanded; relative paths are rejected.
+   */
+  extraRoots: [],
+  /**
+   * What a write does when its ONLY objection is that it lands outside the
+   * session's project directory.
+   *   "deny" — refuse it (the original behaviour).
+   *   "ask"  — hand it to the human via Claude Code's own permission prompt,
+   *            and if they approve, remember that folder so the question is
+   *            asked once per folder rather than once per file.
+   * A sensitive path (credentials, shell/system config, code that runs on its
+   * own) is never askable and always denies, inside a declared root or not.
+   */
+  outsideProjectAction: "deny",
+  /**
+   * Where an approved folder is remembered. Kept apart from config.json on
+   * purpose: extraRoots is what you declared by hand, this is what you agreed
+   * to in a prompt. Two files means you can read back what the hook granted
+   * itself, and delete this one without losing your own settings.
+   */
+  rememberedRootsFile: path.join(os.homedir(), ".local", "state", HOOK_NAME, "remembered-roots.json"),
   /** Where this hook's JSONL goes. Deliberately NOT the opencode log dir: the */
   /** analyzer must not blend two harnesses into one gate. */
   logDir: path.join(os.homedir(), ".local", "share", HOOK_NAME, "logs"),
@@ -306,8 +367,124 @@ function resolveHome(p) {
  * apply, the boundary rule does not. The rest of ~/.claude stays outside —
  * settings.json is what enables this hook.
  */
-function ccOwnRoot(abs) {
+/**
+ * Validate user-declared extra roots. A root that aliases HOME, the filesystem
+ * root, or a system root would turn the boundary rule off for most of the disk,
+ * so those are rejected rather than clamped — a silently narrowed root would
+ * look like it worked. Relative paths are rejected because the hook's cwd is
+ * whatever Claude Code happened to spawn it in.
+ */
+function normalizeExtraRoots(value, problems) {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) { problems.push("invalid extraRoots (not an array)"); return [] }
+  const home = os.homedir()
+  const forbidden = new Set(["/", home, "/etc", "/usr", "/var", "/System", "/Library", "/bin", "/sbin", "/opt"])
+  const out = []
+  for (const entry of value) {
+    if (typeof entry !== "string" || !entry.trim()) { problems.push(`invalid extraRoots entry ${JSON.stringify(entry)}`); continue }
+    const abs = path.resolve(resolveHome(entry.trim()))
+    if (!path.isAbsolute(abs)) { problems.push(`extraRoots entry ${entry} is not absolute; ignored`); continue }
+    if (forbidden.has(abs)) { problems.push(`extraRoots entry ${entry} resolves to ${abs}, which is too broad; ignored`); continue }
+    // A root at or above HOME would cover the whole home tree.
+    if (home === abs || home.startsWith(abs.endsWith("/") ? abs : abs + "/")) {
+      problems.push(`extraRoots entry ${entry} contains the home directory; ignored`)
+      continue
+    }
+    out.push(abs)
+  }
+  return out
+}
+
+/**
+ * The folder we would offer to remember for `abs`: the nearest ancestor holding
+ * a .git, else the file's own directory. Asking about a repo rather than a
+ * single directory is what makes this once-per-project instead of once-per-file,
+ * and a repo root is a boundary the user already drew.
+ */
+function candidateRootFor(abs) {
+  let dir = path.dirname(abs)
+  const home = os.homedir()
+  for (let i = 0; i < 40 && dir && dir !== "/" && dir !== home; i++) {
+    try {
+      if (fs.existsSync(path.join(dir, ".git"))) return dir
+    } catch {}
+    const up = path.dirname(dir)
+    if (up === dir) break
+    dir = up
+  }
+  return path.dirname(abs)
+}
+
+/** Roots the user approved at a prompt. Never written by hand; see HOOK_DEFAULTS. */
+function loadRememberedRoots(cfg) {
+  const data = readJson(cfg.rememberedRootsFile)
+  return normalizeExtraRoots(Array.isArray(data?.roots) ? data.roots : [], [])
+}
+
+/** Add one approved root. Idempotent; failure to persist is logged, never fatal. */
+function rememberRoot(cfg, root) {
+  const current = loadRememberedRoots(cfg)
+  if (current.includes(root)) return { added: false, roots: current }
+  const roots = [...current, root]
+  fs.mkdirSync(path.dirname(cfg.rememberedRootsFile), { recursive: true, mode: 0o700 })
+  fs.writeFileSync(cfg.rememberedRootsFile, JSON.stringify({ roots }, null, 2) + "\n", { mode: 0o600 })
+  return { added: true, roots }
+}
+
+
+/**
+ * Park the folder we offered, against the tool call we offered it for.
+ *
+ * PreToolUse cannot see the user's answer — the process is gone before the
+ * prompt is drawn. PostToolUse only fires if the call actually ran, which for
+ * an "ask" means the human approved it. Matching the two by tool_use_id is what
+ * makes "remember this folder" mean "remember the folder the user just said yes
+ * to", and not "remember any folder a write happened to touch".
+ *
+ * Entries expire: an ask the user declined is never collected, so without a TTL
+ * the file would grow forever with folders nobody approved.
+ */
+const ASK_TTL_MS = 10 * 60_000
+const ASK_MAX = 50
+
+function parkAsk(cfg, toolUseId, root) {
+  if (!toolUseId || !root) return
+  try {
+    const file = path.join(cfg.stateDir, "pending-asks.json")
+    const now = Date.now()
+    const prev = readJson(file)
+    const kept = (Array.isArray(prev?.asks) ? prev.asks : [])
+      .filter((a) => a && typeof a.id === "string" && now - (a.at ?? 0) < ASK_TTL_MS && a.id !== toolUseId)
+      .slice(-ASK_MAX)
+    kept.push({ id: toolUseId, root, at: now })
+    fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 })
+    fs.writeFileSync(file, JSON.stringify({ asks: kept }, null, 2) + "\n", { mode: 0o600 })
+  } catch {}
+}
+
+/** Take back a parked ask, removing it. Returns the root, or null. */
+function claimAsk(cfg, toolUseId) {
+  if (!toolUseId) return null
+  try {
+    const file = path.join(cfg.stateDir, "pending-asks.json")
+    const now = Date.now()
+    const asks = (readJson(file)?.asks ?? []).filter((a) => a && now - (a.at ?? 0) < ASK_TTL_MS)
+    const hit = asks.find((a) => a.id === toolUseId)
+    if (!hit) return null
+    const rest = asks.filter((a) => a.id !== toolUseId)
+    fs.writeFileSync(file, JSON.stringify({ asks: rest }, null, 2) + "\n", { mode: 0o600 })
+    return hit.root
+  } catch {
+    return null
+  }
+}
+
+function ccOwnRoot(abs, extraRoots = []) {
   const under = (root) => abs === root || abs.startsWith(root.endsWith("/") ? root : root + "/")
+  // User-declared roots first: an explicit choice outranks the built-ins, and
+  // returning the DECLARED root (not a built-in that happens to also match)
+  // keeps judgeWritePath's boundary anchored where the user said.
+  for (const root of extraRoots) if (under(root)) return root
   const uid = typeof process.getuid === "function" ? process.getuid() : null
   if (uid !== null) {
     for (const root of [`/private/tmp/claude-${uid}`, `/tmp/claude-${uid}`]) if (under(root)) return root
@@ -411,6 +588,13 @@ function resolveHookConfig(internals, env = process.env) {
   }
   for (const k of ["logDir", "stateDir"]) {
     if (typeof merged[k] !== "string" || !merged[k]) { problems.push(`invalid ${k}`); merged[k] = HOOK_DEFAULTS[k] }
+  }
+  merged.extraRoots = normalizeExtraRoots(merged.extraRoots, problems)
+  if (!["deny", "ask"].includes(merged.outsideProjectAction)) {
+    problems.push(`invalid outsideProjectAction`); merged.outsideProjectAction = HOOK_DEFAULTS.outsideProjectAction
+  }
+  if (typeof merged.rememberedRootsFile !== "string" || !merged.rememberedRootsFile) {
+    problems.push("invalid rememberedRootsFile"); merged.rememberedRootsFile = HOOK_DEFAULTS.rememberedRootsFile
   }
   // The classifier call keeps its own timeout, but it must finish inside our
   // deadline or the watchdog fires first and we lose the verdict's reason.
@@ -572,7 +756,7 @@ function logClassification(log, I, base, kind, subject, classifier, result, via,
     prompt_version: I.PROMPT_VERSION,
     verdict: result.verdict, reason: result.reason, failure: result.failure,
     latency_ms: result.latencyMs, raw_output: I.truncated(result.raw, 4000),
-    streamed: Boolean(result.streamed), via, ...(probe ? { probe } : {}),
+    session: result.session ?? null, streamed: Boolean(result.streamed), via, ...(probe ? { probe } : {}),
   })
 }
 
@@ -705,7 +889,7 @@ async function worker() {
   if (result.verdict === "RISKY" && result.rest) latencyMs = (await result.rest).latencyMs
   say({
     verdict: result.verdict, reason: result.reason, raw: result.raw,
-    failure: result.failure, latencyMs, streamed: Boolean(result.rest),
+    failure: result.failure, latencyMs, streamed: Boolean(result.rest), session: result.session ?? null,
   })
   const log = I.createLogger({ ...classifier, logDir: cfg.logDir })
   if (job.detached) {
@@ -860,6 +1044,27 @@ async function main() {
 
   const tool = input?.tool_name
   const args = input?.tool_input ?? {}
+
+  /**
+   * PostToolUse: the call RAN, so if we asked about it the human said yes.
+   * Collect the folder we offered and remember it. Nothing is decided here —
+   * PostToolUse cannot block — so this path only ever writes state and exits 0.
+   */
+  if (input?.hook_event_name === "PostToolUse") {
+    try {
+      const root = claimAsk(cfg, input?.tool_use_id ?? null)
+      if (root && acting) {
+        const { added } = rememberRoot(cfg, root)
+        I.createLogger({ ...classifier, logDir: cfg.logDir }).log("action", {
+          harness: "claude-code", hook_version: HOOK_VERSION,
+          session_id: input?.session_id ?? null, tool_use_id: input?.tool_use_id ?? null,
+          tool, decided: "remembered", why: added ? `remembered ${root}` : `${root} already remembered`,
+          candidateRoot: root,
+        })
+      }
+    } catch {}
+    return approve(null, "post")
+  }
   const projectDir = typeof input?.cwd === "string" && input.cwd ? input.cwd : process.cwd()
   const log = I.createLogger({ ...classifier, logDir: cfg.logDir })
   const base = {
@@ -880,7 +1085,7 @@ async function main() {
    * we never looked at. Shadow logs allow/deny as would_* and says nothing.
    */
   const decide = (outcome, why, extra = {}) => {
-    const speaks = outcome === "allow" || outcome === "deny"
+    const speaks = outcome === "allow" || outcome === "deny" || outcome === "ask"
     log.log("action", {
       ...base, ...extra,
       decided: speaks && !acting ? `would_${outcome}` : outcome,
@@ -888,6 +1093,14 @@ async function main() {
     })
     if (outcome === "deny" && acting) return deny(why)
     if (outcome === "allow" && acting) return approve("allow", why)
+    // "ask" hands the decision to the human. The candidate root is parked
+    // against this tool_use_id so the PostToolUse pass knows the call it is
+    // looking at is one WE asked about, and which folder was offered. In
+    // shadow it logs would_ask and says nothing, like the other two.
+    if (outcome === "ask" && acting) {
+      if (extra.candidateRoot) parkAsk(cfg, base.tool_use_id, extra.candidateRoot)
+      return askUser(why)
+    }
     return approve(null, why)
   }
   late = decide
@@ -971,18 +1184,34 @@ async function main() {
     return settle(await run("bash", command, "classified RISKY"), "classified RISKY")
   }
 
+  // Declared roots plus the ones approved at a prompt. Both widen the
+  // boundary the same way; only their provenance differs.
+  const allRoots = [...(cfg.extraRoots ?? []), ...loadRememberedRoots(cfg)]
+
   // Deterministic rules, no model call: predictable and instant.
   if (CC_WRITE_TOOLS.has(tool)) {
     let own = false
     for (const target of I.collectPaths(args)) {
       const abs = path.resolve(projectDir, resolveHome(target))
-      const root = ccOwnRoot(abs)
+      const root = ccOwnRoot(abs, allRoots)
       own = own || root !== null
       const why = I.judgeWritePath(abs, root ?? projectDir)
-      if (why) return decide("deny", `${tool} target ${target}: ${why}`)
+      if (why) {
+        // Is the boundary the ONLY objection? Ask the same judge again with a
+        // root that would contain the target: if it passes there, nothing but
+        // "outside the project" was wrong, and that is a question worth asking.
+        // A sensitive path fails under any root and is never offered.
+        const candidate = candidateRootFor(abs)
+        const askable = cfg.outsideProjectAction === "ask" && I.judgeWritePath(abs, candidate) === null
+        if (askable) {
+          return decide("ask", `${tool} target ${target}: ${why}. Approving also remembers ${candidate} as an allowed folder.`,
+            { candidateRoot: candidate })
+        }
+        return decide("deny", `${tool} target ${target}: ${why}`)
+      }
     }
     return decide("pass", own
-      ? "write inside Claude Code's own scratchpad or memory directory"
+      ? "write inside Claude Code's own areas or a declared extra root"
       : "write target inside the project and not sensitive")
   }
 
@@ -993,9 +1222,9 @@ async function main() {
     // project memory area" (measured 2026-09-02). See ccOwnRoot.
     const outside = I.collectPaths(args).filter((p) => {
       const abs = path.resolve(projectDir, resolveHome(p))
-      return I.isOutside(abs, projectDir) && ccOwnRoot(abs) === null
+      return I.isOutside(abs, projectDir) && ccOwnRoot(abs, allRoots) === null
     })
-    if (outside.length === 0) return decide("pass", "read stays inside the project or Claude Code's own areas")
+    if (outside.length === 0) return decide("pass", "read stays inside the project, Claude Code's own areas, or a declared extra root")
     const prefix = "path outside the project classified RISKY"
     return settle(await run("external_directory", outside.join("\n"), prefix), prefix)
   }
@@ -1018,7 +1247,8 @@ async function main() {
  */
 export const hookInternals = Object.freeze({
   HOOK_DEFAULTS, POSTURES, HOOK_VERSION,
-  peekMode, resolveHookConfig, ccOwnRoot,
+  peekMode, resolveHookConfig, ccOwnRoot, normalizeExtraRoots,
+  candidateRootFor, loadRememberedRoots, rememberRoot, parkAsk, claimAsk,
   loadBreaker, cooldownFor, probeBusy, planFor,
 })
 

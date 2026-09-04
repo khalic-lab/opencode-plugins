@@ -232,6 +232,12 @@ describe("resolveConfig — never crashes, never silently escalates", () => {
     expect(config.timeoutMs).toBe(10_000)
     expect(problems).toEqual([])
   })
+  test("sessionPool defaults to 2; a negative value degrades to the default, reported", () => {
+    expect(resolveConfig({ readFile: noFile, env: {} }).config.sessionPool).toBe(2)
+    const { config, problems } = resolveConfig({ readFile: () => ({ sessionPool: -1 }), env: {} })
+    expect(config.sessionPool).toBe(2)
+    expect(problems).toEqual(["invalid sessionPool"])
+  })
   test("invalid mode degrades to shadow, reported", () => {
     const { config, problems } = resolveConfig({ options: { mode: "yolo" }, readFile: noFile, env: {} })
     expect(config.mode).toBe("shadow")
@@ -665,6 +671,41 @@ describe("classify — streamed, settled on the first line", () => {
     // A JSON answer to a streaming request is still read whole.
     expect(a.verdict).toBe("SAFE"); expect(a.reason).toBe("x"); expect(a.rest).toBeNull()
     expect(b.verdict).toBe("SAFE"); expect(b.rest).toBeNull()
+  })
+  test("the request names a model-server session, rotating over the pool per kind", async () => {
+    const seen = []
+    const answer = { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: x" } }] }) }
+    const capture = async (_url, init) => { seen.push(init.headers["x-mtplx-session-id"] ?? null); return answer }
+    for (let i = 0; i < 4; i++) await classify({ kind: "bash", subject: "ls", config, fetchImpl: capture })
+    await classify({ kind: "external_directory", subject: "/x", config, fetchImpl: capture })
+    expect(seen.slice(0, 4).every((id) => /^local-classifier-bash-[01]$/.test(id))).toBe(true)
+    expect(seen[0]).not.toBe(seen[1])
+    expect(seen[0]).toBe(seen[2])
+    expect(seen[4]).toMatch(/^local-classifier-external_directory-[01]$/)
+    await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl: capture })
+    expect(seen[5]).toBeNull()
+  })
+  test("a 409 on the named session retries once without it and still decides", async () => {
+    const calls = []
+    const fetchImpl = async (_url, init) => {
+      const id = init.headers["x-mtplx-session-id"] ?? null
+      calls.push(id)
+      if (id) return { ok: false, status: 409 }
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: x" } }] }) }
+    }
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    expect(calls.length).toBe(2)
+    expect(calls[0]).toMatch(/^local-classifier-bash-/)
+    expect(calls[1]).toBeNull()
+    expect(r.verdict).toBe("SAFE")
+    expect(r.session).toEqual({ id: calls[0], fallback: true })
+  })
+  test("a 409 with no session id is an ordinary http failure, not retried", async () => {
+    let n = 0
+    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl: async () => { n++; return { ok: false, status: 409 } } })
+    expect(n).toBe(1)
+    expect(r.failure).toBe("http_409")
+    expect(r.session).toEqual({ id: null, fallback: false })
   })
   test("parseVerdictLine accepts exactly a verdict line", () => {
     expect(parseVerdictLine("VERDICT: SAFE")).toBe("SAFE")
