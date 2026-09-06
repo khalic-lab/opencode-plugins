@@ -25,7 +25,11 @@ import { fileURLToPath } from "node:url"
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repoDir = path.join(here, "..", "packages", "local-classifier")
 const deployDir = process.argv[2] ?? path.join(os.homedir(), ".config", "opencode", "local-classifier")
-const FILES = ["local-classifier.js", "local-classifier-tui.tsx", "tui-view.js"]
+// bash-rules.mjs is imported BY local-classifier.js, so a missing copy is not a
+// drift, it is a plugin that throws ERR_MODULE_NOT_FOUND on load and classifies
+// nothing. It was absent from this list — and from the deployed directory —
+// until 2026-09-06; every file the plugin imports at runtime belongs here.
+const FILES = ["local-classifier.js", "bash-rules.mjs", "local-classifier-tui.tsx", "tui-view.js"]
 
 const sha = (f) => crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")
 
