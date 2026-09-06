@@ -1,0 +1,41 @@
+{
+  "name": "omp-local-classifier",
+  "version": "0.1.0",
+  "description": "Local-model safety classifier as a veto in front of Oh My Pi tool calls. Shares one prompt and decision core with the opencode plugin. Fail-closed, shadow-mode first.",
+  "license": "MIT",
+  "author": "Rafael Nogueira",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/khalic-lab/opencode-plugins.git",
+    "directory": "packages/omp-extension"
+  },
+  "type": "module",
+  "main": "./omp-local-classifier.js",
+  "exports": {
+    ".": "./omp-local-classifier.js"
+  },
+  "omp": {
+    "extensions": ["./omp-local-classifier.js"]
+  },
+  "pi": {
+    "extensions": ["./omp-local-classifier.js"]
+  },
+  "files": [
+    "omp-local-classifier.js"
+  ],
+  "dependencies": {
+    "opencode-local-classifier": "workspace:*"
+  },
+  "engines": {
+    "omp": ">=18.1.0"
+  },
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "omp-extension",
+    "permissions",
+    "classifier",
+    "local-llm",
+    "mlx"
+  ]
+}

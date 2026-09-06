@@ -1,0 +1,25 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "opencode-plugins-workspace",
+    },
+    "packages/local-classifier": {
+      "name": "opencode-local-classifier",
+      "version": "0.1.0",
+    },
+    "packages/omp-extension": {
+      "name": "omp-local-classifier",
+      "version": "0.1.0",
+      "dependencies": {
+        "opencode-local-classifier": "workspace:*",
+      },
+    },
+  },
+  "packages": {
+    "omp-local-classifier": ["omp-local-classifier@workspace:packages/omp-extension"],
+
+    "opencode-local-classifier": ["opencode-local-classifier@workspace:packages/local-classifier"],
+  }
+}
