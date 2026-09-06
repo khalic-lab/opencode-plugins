@@ -482,7 +482,7 @@ describe("project_dir injection (p6)", () => {
       bodies.push(JSON.parse(init.body))
       return { ok: true, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: ok" } }] }) }
     }
-    const config = { ...resolveConfig({}).config, timeoutMs: 1000 }
+    const config = { ...resolveConfig({ readFile: () => null, env: {} }).config, timeoutMs: 1000 }
     for (const dir of ["/usr/local/src/webapp-142", "/Users/dev/other"]) {
       await classify({ kind: "bash", subject: "ls", config, projectDir: dir, fetchImpl })
     }
@@ -497,7 +497,7 @@ describe("project_dir injection (p6)", () => {
       sent = JSON.parse(init.body)
       return { ok: true, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: ok" } }] }) }
     }
-    const config = { ...resolveConfig({}).config, timeoutMs: 1000 }
+    const config = { ...resolveConfig({ readFile: () => null, env: {} }).config, timeoutMs: 1000 }
     await classify({ kind: "bash", subject: "mkdir -p /proj/src", config, projectDir: "/proj", fetchImpl })
     expect(sent.messages[1].content).toContain("<project_dir>\n/proj\n</project_dir>")
     expect(sent.messages[0].content).toBe(BASH_SYSTEM_PROMPT)
@@ -514,7 +514,7 @@ describe("project_dir injection (p6)", () => {
       seen.push(JSON.parse(init.body))
       return { ok: true, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: ok" } }] }) }
     }
-    const config = { ...resolveConfig({}).config, timeoutMs: 1000 }
+    const config = { ...resolveConfig({ readFile: () => null, env: {} }).config, timeoutMs: 1000 }
     await classify({ kind: "bash", subject: "ls", config, fetchImpl })
     await classify({ kind: "external_directory", subject: "/tmp/x", config, fetchImpl })
     expect(seen).toHaveLength(2)
@@ -694,19 +694,81 @@ describe("classify — streamed, settled on the first line", () => {
       return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: x" } }] }) }
     }
     const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
-    expect(calls.length).toBe(2)
+    // Ladder: this call's own id, then the pool's other id, then anonymous.
+    expect(calls.length).toBe(3)
     expect(calls[0]).toMatch(/^local-classifier-bash-/)
-    expect(calls[1]).toBeNull()
+    expect(calls[1]).toMatch(/^local-classifier-bash-/)
+    expect(calls[1]).not.toBe(calls[0])
+    expect(calls[2]).toBeNull()
     expect(r.verdict).toBe("SAFE")
-    expect(r.session).toEqual({ id: calls[0], fallback: true })
+    expect(r.session).toEqual({ id: calls[0], used: null, fallback: true })
   })
   test("a 409 with no session id is an ordinary http failure, not retried", async () => {
     let n = 0
     const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl: async () => { n++; return { ok: false, status: 409 } } })
     expect(n).toBe(1)
     expect(r.failure).toBe("http_409")
-    expect(r.session).toEqual({ id: null, fallback: false })
+    expect(r.session).toEqual({ id: null, used: null, fallback: false })
   })
+  // The secondary streams, so a busy named session reaches `empty_output`
+  // through the SSE path and NOT through the whole-answer path. A fake that
+  // answers JSON would exercise a branch the secondary never takes and pass
+  // while production kept returning nothing.
+  test("a streamed answer with no tokens is treated as a busy session and steps down the ladder", async () => {
+    const calls = []
+    const fetchImpl = async (url, init) => {
+      const id = init.headers["x-mtplx-session-id"] ?? null
+      calls.push(id)
+      // mtplx answers 200 with zero completion tokens while the named session
+      // is still generating; only the third rung is free.
+      if (calls.length < 3) return sse([[0, null]])(url, init)
+      return sse([[0, "VERDICT: SAFE\nREASON: x"], [0, null]])(url, init)
+    }
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    expect(calls.length).toBe(3)
+    expect(calls[0]).toMatch(/^local-classifier-bash-/)
+    expect(calls[1]).not.toBe(calls[0])
+    expect(calls[2]).toBeNull()
+    expect(r.verdict).toBe("SAFE")
+    expect(r.session.fallback).toBe(true)
+    expect(r.session.used).toBeNull()
+  })
+
+  // At the default pool of 2, "the other id" and "not the first id" are the
+  // same assertion, so a pool of 3 is the only way to see that the ladder walks
+  // the whole pool exactly once before it gives up and goes anonymous.
+  test("the ladder walks every id in a pool of 3 once, then anonymous", async () => {
+    const calls = []
+    const fetchImpl = async (url, init) => {
+      calls.push(init.headers["x-mtplx-session-id"] ?? null)
+      return sse([[0, null]])(url, init)
+    }
+    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 3 }, fetchImpl })
+    expect(calls.length).toBe(4)
+    expect(calls[3]).toBeNull()
+    const named = calls.slice(0, 3)
+    expect(new Set(named).size).toBe(3)
+    for (const id of named) expect(id).toMatch(/^local-classifier-bash-[012]$/)
+    expect(r.failure).toBe("empty_output")
+  })
+
+  test("an empty answer on the LAST rung is reported, not retried forever", async () => {
+    let n = 0
+    const fetchImpl = async (url, init) => { n++; return sse([[0, null]])(url, init) }
+    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    expect(n).toBe(3)
+    expect(r.failure).toBe("empty_output")
+    expect(r.verdict).toBeNull()
+  })
+
+  test("a pool of 0 sends no header and never retries an empty answer", async () => {
+    let n = 0
+    const fetchImpl = async (url, init) => { n++; return sse([[0, null]])(url, init) }
+    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl })
+    expect(n).toBe(1)
+    expect(r.failure).toBe("empty_output")
+  })
+
   test("parseVerdictLine accepts exactly a verdict line", () => {
     expect(parseVerdictLine("VERDICT: SAFE")).toBe("SAFE")
     expect(parseVerdictLine("  verdict: risky ")).toBe("RISKY")

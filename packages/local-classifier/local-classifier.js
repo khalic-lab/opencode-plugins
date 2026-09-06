@@ -58,7 +58,7 @@ import path from "node:path"
 import { judgeBashCommand } from "./bash-rules.mjs"
 
 const PLUGIN_NAME = "local-classifier"
-const PLUGIN_VERSION = "0.3.0"
+const PLUGIN_VERSION = "0.3.1"
 /**
  * Bump whenever BASH_SYSTEM_PROMPT / DIRECTORY_SYSTEM_PROMPT change in any
  * way. Logged on every classification line so the analyzer can refuse to
@@ -1008,13 +1008,51 @@ function failureOf(e, prefix = "") {
 
 /** The header mtplx consults first when resolving a request's session. */
 const SESSION_HEADER = "x-mtplx-session-id"
-let sessionRotation = 0
+
+/**
+ * Where this process starts in the pool.
+ *
+ * The rotation itself is right for the PLUGIN, which is one long-lived process
+ * whose classifications can overlap. It is useless for the cc-hook, which is a
+ * fresh process per tool call — the same reason `loadBreaker` keeps its counter
+ * on disk rather than in a closure — because a counter that starts at 0 every
+ * time hands every concurrent process the same names. Measured 2026-09-06: of
+ * 104 mtplx requests during one eval run beside one ordinary session, 33 came
+ * back with zero tokens and ALL 33 were on `local-classifier-bash-1`.
+ *
+ * Seeding from the pid spreads processes across the pool without widening it,
+ * so the ~2 GB per kind that `sessionPool` was sized for is unchanged.
+ */
+const sessionSeed = Number.isInteger(globalThis.process?.pid)
+  ? globalThis.process.pid
+  : Math.floor(Math.random() * 1e6)
+let sessionRotation = sessionSeed
 
 /** `local-classifier-<kind>-<n>`, n rotating over the pool; null when the pool is 0. */
 function sessionIdFor(kind, pool) {
   const size = Number.isFinite(pool) ? Math.floor(pool) : 0
   if (size <= 0) return null
   return `local-classifier-${kind}-${sessionRotation++ % size}`
+}
+
+/**
+ * The ids this call may use, in order: its own, then the rest of the pool,
+ * then `null` for the anonymous path.
+ *
+ * Anonymous stays the LAST rung rather than the first. It always works, but
+ * 184 anonymous sessions are what pinned the 8 GB session bank on 2026-09-03
+ * and are the reason names exist at all; a tier that fires only when the whole
+ * pool is busy is a floor, not a habit.
+ */
+function sessionLadder(first, kind, pool) {
+  if (!first) return [null]
+  const size = Number.isFinite(pool) ? Math.floor(pool) : 0
+  const rest = []
+  for (let i = 1; i < size; i++) {
+    const id = `local-classifier-${kind}-${(sessionRotation + i - 1) % size}`
+    if (id !== first && !rest.includes(id)) rest.push(id)
+  }
+  return [first, ...rest, null]
 }
 
 /**
@@ -1063,9 +1101,12 @@ function verdictConfidence(content) {
  */
 async function classifyOnce(args) {
   // Every stage names a model-server session (DEFAULTS.sessionPool) and the
-  // result records it as `session: { id, fallback }`; `fallback` is true when
-  // the named session was busy (HTTP 409) and the call went through anonymously.
-  const attempt = { id: sessionIdFor(args.kind, args.config?.sessionPool ?? DEFAULTS.sessionPool), fallback: false }
+  // result records it as `session: { id, used, fallback }`: `id` is the name
+  // this call asked for, `used` the one it was actually served on (null on the
+  // anonymous rung), and `fallback` says they differ. `used` is what the log
+  // needs — without it a retry within the pool and a drop to anonymous look
+  // identical, and only the second one puts the session bank at risk.
+  const attempt = { id: sessionIdFor(args.kind, args.config?.sessionPool ?? DEFAULTS.sessionPool), used: null, fallback: false }
   const result = await classifyRequest({ ...args, attempt })
   result.session = attempt
   return result
@@ -1125,78 +1166,100 @@ async function classifyRequest({
       })
     const json = { "content-type": "application/json" }
     const post = (headers) => fetchImpl(url, { method: "POST", headers, signal: controller.signal, body })
-    let res = await post(attempt?.id ? { ...json, [SESSION_HEADER]: attempt.id } : json)
-    if (attempt?.id && res.status === 409) {
-      // mtplx: the named session is still generating — two classifications
-      // overlapped. Retry once anonymously rather than fail the permission.
-      attempt.fallback = true
-      res = await post(json)
-    }
-    const latencyMs = now() - started
-    if (!res.ok) {
-      return { verdict: null, reason: null, raw: null, latencyMs, failure: `http_${res.status}`, rest: null, ...confidence }
-    }
-    const contentType = String(res.headers?.get?.("content-type") ?? "")
-    const sse = streaming && typeof res.body?.getReader === "function" && /text\/event-stream/i.test(contentType)
-    if (!sse) {
-      // Whole-answer path: `stream: false`, or a server that answered JSON.
-      const body = await res.json()
-      if (logprobs) confidence = verdictConfidence(body?.choices?.[0]?.logprobs?.content)
-      return whole(body?.choices?.[0]?.message?.content ?? null, latencyMs)
+    // Reading one response, whichever shape it came in. Factored out so the
+    // session ladder below can issue the request more than once.
+    const readResponse = async (res) => {
+      const latencyMs = now() - started
+      if (!res.ok) {
+        return { verdict: null, reason: null, raw: null, latencyMs, failure: `http_${res.status}`, rest: null, ...confidence }
+      }
+      const contentType = String(res.headers?.get?.("content-type") ?? "")
+      const sse = streaming && typeof res.body?.getReader === "function" && /text\/event-stream/i.test(contentType)
+      if (!sse) {
+        // Whole-answer path: `stream: false`, or a server that answered JSON.
+        const body = await res.json()
+        if (logprobs) confidence = verdictConfidence(body?.choices?.[0]?.logprobs?.content)
+        return whole(body?.choices?.[0]?.message?.content ?? null, latencyMs)
+      }
+
+      // Streamed: settle `head` the moment the first line is closed, or when the
+      // stream ends first. The pump goes on running either way.
+      const sink = { text: "" }
+      let settleHead = () => {}
+      const head = new Promise((resolve) => { settleHead = resolve })
+      let streamEnded = false
+      let streamError = null
+      const pump = readSse(res.body, sink, () => { if (closedFirstLine(sink.text) !== null) settleHead() })
+        .then(() => { streamEnded = true }, (e) => { streamError = e; streamEnded = true })
+        .finally(() => settleHead())
+      await head
+      const decidedAt = now()
+      const first = closedFirstLine(sink.text) ?? (streamEnded ? sink.text : null)
+      const verdict = parseVerdictLine(first)
+      if (!verdict) {
+        // No verdict on line 1 (or nothing at all): the answer fails closed as
+        // a whole. Read to the end so the log gets the full text.
+        await pump
+        if (streamError && !sink.text) throw streamError
+        return whole(sink.text || null, now() - started)
+      }
+      if (streamEnded) {
+        // The whole answer is already here (a verdict-only answer, or a tail
+        // faster than the head): judge it whole, exactly as before.
+        return whole(sink.text, decidedAt - started)
+      }
+      if (decidedAt > deadline) {
+        controller.abort()
+        return { verdict: null, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: "late_after_deadline", rest: null, ...confidence }
+      }
+      // Hand the decision out now; the tail keeps reading under its own clock.
+      handedOff = true
+      clearTimeout(timer)
+      timer = setTimeout(() => controller.abort(), config.tailTimeoutMs ?? DEFAULTS.tailTimeoutMs)
+      const result = { verdict, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: null, rest: null, ...confidence }
+      result.rest = pump.then(() => {
+        clearTimeout(timer)
+        const raw = sink.text
+        const tail = { reason: reasonOf(raw), raw, latencyMs: now() - started, failure: null, contradicted: false }
+        if (streamError) {
+          tail.failure = failureOf(streamError, "tail_")
+        } else {
+          const parsed = parseVerdict(raw)
+          tail.contradicted = !parsed || parsed.verdict !== verdict
+          if (parsed) tail.reason = parsed.reason
+        }
+        result.reason = tail.reason
+        result.raw = raw
+        result.tail = tail
+        return tail
+      })
+      return result
     }
 
-    // Streamed: settle `head` the moment the first line is closed, or when the
-    // stream ends first. The pump goes on running either way.
-    const sink = { text: "" }
-    let settleHead = () => {}
-    const head = new Promise((resolve) => { settleHead = resolve })
-    let streamEnded = false
-    let streamError = null
-    const pump = readSse(res.body, sink, () => { if (closedFirstLine(sink.text) !== null) settleHead() })
-      .then(() => { streamEnded = true }, (e) => { streamError = e; streamEnded = true })
-      .finally(() => settleHead())
-    await head
-    const decidedAt = now()
-    const first = closedFirstLine(sink.text) ?? (streamEnded ? sink.text : null)
-    const verdict = parseVerdictLine(first)
-    if (!verdict) {
-      // No verdict on line 1 (or nothing at all): the answer fails closed as
-      // a whole. Read to the end so the log gets the full text.
-      await pump
-      if (streamError && !sink.text) throw streamError
-      return whole(sink.text || null, now() - started)
+    // The session ladder. mtplx signals "this named session is still
+    // generating" TWO ways, and only one of them is an error: HTTP 409, and —
+    // measured 2026-09-06 — HTTP 200 carrying zero completion tokens and
+    // finish_reason "stop", which arrives in under a millisecond and parses as
+    // `empty_output`. Watching only for the 409 is why 33 of 104 requests
+    // returned nothing during an ordinary concurrent run. Both now step to the
+    // next id, and only a fully busy pool falls through to anonymous.
+    //
+    // A genuinely empty answer from an idle model costs one extra call here.
+    // That is the accepted price: telling the two apart by latency is exactly
+    // the kind of heuristic that stops being true on a slower box.
+    const ladder = sessionLadder(attempt?.id ?? null, kind, config.sessionPool ?? DEFAULTS.sessionPool)
+    let out = null
+    for (let rung = 0; rung < ladder.length; rung++) {
+      const sessionId = ladder[rung]
+      const more = rung < ladder.length - 1 && now() <= deadline
+      const res = await post(sessionId ? { ...json, [SESSION_HEADER]: sessionId } : json)
+      if (attempt) { attempt.used = sessionId; attempt.fallback = rung > 0 }
+      if (res.status === 409 && more) continue
+      out = await readResponse(res)
+      if (out.failure === "empty_output" && more) continue
+      return out
     }
-    if (streamEnded) {
-      // The whole answer is already here (a verdict-only answer, or a tail
-      // faster than the head): judge it whole, exactly as before.
-      return whole(sink.text, decidedAt - started)
-    }
-    if (decidedAt > deadline) {
-      controller.abort()
-      return { verdict: null, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: "late_after_deadline", rest: null, ...confidence }
-    }
-    // Hand the decision out now; the tail keeps reading under its own clock.
-    handedOff = true
-    clearTimeout(timer)
-    timer = setTimeout(() => controller.abort(), config.tailTimeoutMs ?? DEFAULTS.tailTimeoutMs)
-    const result = { verdict, reason: null, raw: sink.text, latencyMs: decidedAt - started, failure: null, rest: null, ...confidence }
-    result.rest = pump.then(() => {
-      clearTimeout(timer)
-      const raw = sink.text
-      const tail = { reason: reasonOf(raw), raw, latencyMs: now() - started, failure: null, contradicted: false }
-      if (streamError) {
-        tail.failure = failureOf(streamError, "tail_")
-      } else {
-        const parsed = parseVerdict(raw)
-        tail.contradicted = !parsed || parsed.verdict !== verdict
-        if (parsed) tail.reason = parsed.reason
-      }
-      result.reason = tail.reason
-      result.raw = raw
-      result.tail = tail
-      return tail
-    })
-    return result
+    return out
   } catch (e) {
     return { verdict: null, reason: null, raw: null, latencyMs: now() - started, failure: failureOf(e), rest: null, ...confidence }
   } finally {
