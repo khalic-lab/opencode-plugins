@@ -6,7 +6,8 @@
 # approve the tool call. So every abnormal path through the hook has to be
 # proven to exit 2 — "did not crash" is not the bar, "denied" is.
 #
-# Runs the real hook against the real model, the way eval/smoke.mjs does.
+# Runs the real hook against the real model — the primary the live opencode
+# config names — the way eval/smoke.mjs does.
 # Usage: ./test/exit-discipline.sh
 
 set -u
@@ -24,6 +25,26 @@ HOME_REAL="$HOME"
 H="$TMP/home"
 mkdir -p "$H/.config/cc-local-classifier" "$H/.config/opencode"
 echo '{}' > "$H/.config/cc-local-classifier/config.json"
+
+# The real model is the primary the live opencode config names: endpoint, model
+# and sessionPool only. No cascade, so a verdict is that model's own answer and
+# no hosted secondary or API key is involved. An absent file used to mean the
+# plugin's built-in default, Flash-Next on mtplx; once that was no longer loaded,
+# every real-model case failed on its http_503 (2026-09-14). Sections that dial
+# a fake server write their own file and put this one back with real_model.
+REAL_MODEL="$(python3 -c '
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    c = {}
+print(json.dumps({k: c[k] for k in ("endpoint", "model", "sessionPool") if k in c}))' "$HOME_REAL/.config/opencode/local-classifier.json")"
+real_model() { # [extra-json]: the real model's opencode file, plus any extra keys
+  python3 -c 'import json, sys; c = json.loads(sys.argv[1]); c.update(json.loads(sys.argv[2] or "{}")); print(json.dumps(c))' \
+    "$REAL_MODEL" "${1:-}" > "$H/.config/opencode/local-classifier.json"
+}
+real_model
+echo "real model: $REAL_MODEL"
 
 payload() { # tool, tool_input-json
   printf '{"session_id":"test","cwd":"%s","permission_mode":"auto","hook_event_name":"PreToolUse","tool_name":"%s","tool_input":%s,"tool_use_id":"t"}' \
@@ -178,7 +199,7 @@ echo '{"endpoint":"http://127.0.0.1:9/v1","timeoutMs":2000}' > "$H/.config/openc
 rm -f "$H/.local/state/cc-local-classifier/verdicts.json"
 check "classifier unreachable denied" 2 enforce "$(payload Bash '{"command":"git status"}')"
 check "...and shadow still passes"    0 shadow  "$(payload Bash '{"command":"git status"}')"
-rm -f "$H/.config/opencode/local-classifier.json"
+real_model
 rm -f "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 
 echo "== watchdog: a wedged pipe must not hang =="
@@ -236,7 +257,7 @@ say   "...silently"                           enforce "$(payload Bash '{"command
 POSTURE=veto
 check "hanging classifier denies under veto"  2 enforce "$(payload Bash '{"command":"git status"}')"
 kill "$hang" 2>/dev/null; wait "$hang" 2>/dev/null
-rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
+real_model; rm -f "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 echo '{}' > "$H/.config/cc-local-classifier/config.json"
 
 echo "== an empty cwd is not a project boundary =="
@@ -255,7 +276,7 @@ echo '{"endpoint":"http://127.0.0.1:9/v1","timeoutMs":2000}' > "$H/.config/openc
 rm -f "$H/.local/state/cc-local-classifier/verdicts.json"
 check "classifier unreachable passes through" 0 enforce "$(payload Bash '{"command":"git status"}')"
 say   "...silently"                       enforce "$(payload Bash '{"command":"git status"}')" silent
-rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
+real_model; rm -f "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 check "hook crash still denies (a bug is loud)" 2 enforce "$(payload Bash '{"command":"git status"}')" \
       CC_CLASSIFIER_MODULE=/nonexistent/module.js
 # No posture anywhere (no env, {} config): the default must be cascade.
@@ -380,7 +401,7 @@ logcheck "busy is logged as unjudged"        '"outcome":"unjudged".*"unjudged_wh
 logcheck "...with the request it saw"         '"prompt_tokens":52000'
 logcheck "busy is its own failure kind"       '"failure":"busy"'
 kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
-rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
+real_model; rm -f "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 
 echo "== detached shadow: the hook is gone before the model answers =="
 # Hermetic: a server whose flight list is empty and whose completions answer
@@ -422,7 +443,7 @@ logcheck "the probe was free, and says so"    '"probe":"free"'
 logcheck "blocking row is the hook's"         '"subject":"git log --oneline -1 blocking-probe".*"via":"worker"'
 lognone  "blocking row is not detached"       '"subject":"git log --oneline -1 blocking-probe".*"via":"worker-detached"'
 kill "$canned" 2>/dev/null; wait "$canned" 2>/dev/null
-rm -f "$H/.config/opencode/local-classifier.json"
+real_model
 
 echo "== the log says what happened, in the hook's own mode =="
 # The opencode file says enforce, the hook is in shadow. Until 0.2.0 every
@@ -430,12 +451,12 @@ echo "== the log says what happened, in the hook's own mode =="
 # opencode config. This is the regression test for that.
 settle_workers
 rm -rf "$LOGDIR"
-echo '{"mode":"enforce"}' > "$H/.config/opencode/local-classifier.json"
+real_model '{"mode":"enforce"}'
 POSTURE=cascade
 say   "shadow over an enforce opencode file"  shadow "$(payload Bash '{"command":"git status"}')" silent
 POSTURE=veto
 say   "...and a would-be deny"                shadow "$(payload Bash '{"command":"rm -rf /Users/x/project/src"}')" silent
-rm -f "$H/.config/opencode/local-classifier.json"
+real_model
 settle_workers
 logcheck "rows carry mode:shadow"                '"mode":"shadow"'
 # Schema 2 has no tail row: the streamed reason is folded into the one
