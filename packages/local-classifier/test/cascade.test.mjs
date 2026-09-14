@@ -165,6 +165,93 @@ describe("verdictConfidence — the logprobs of a real answer", () => {
   })
 })
 
+/**
+ * A REAL split answer, captured on 2026-09-14 from MiniCPM5-2B (8-bit) through
+ * mlxctl for `git status` (top_logprobs: 8): the verdict is "ĠS" then "AFE",
+ * both at logprob 0. Note the other S-words on offer at the verdict position —
+ * "ĠSIS", "ĠSAN", "ĠUNS" — which is why a bare "S" alternative is never a
+ * SAFE vote by itself.
+ */
+const SPLIT_KEYWORD = [
+  { token: "VER", logprob: 0 },
+  { token: "D", logprob: 0 },
+  { token: "ICT", logprob: 0 },
+  { token: ":", logprob: 0 },
+]
+const splitVerdict = (token, logprob) => ({
+  token,
+  logprob,
+  top_logprobs: [
+    { token: "ĠS", logprob: 0 },
+    { token: "ĠRIS", logprob: -8.25 },
+    { token: "ĠRISK", logprob: -14.75 },
+    { token: "ĠSAF", logprob: -16.625 },
+    { token: "ĠR", logprob: -17.375 },
+    { token: "ĠSIS", logprob: -18.125 },
+    { token: "ĠSAN", logprob: -18.25 },
+    { token: "ĠUNS", logprob: -18.5 },
+  ],
+})
+const splitSafe = (...rest) => [...SPLIT_KEYWORD, splitVerdict("ĠS", 0), ...rest]
+const REAL_SPLIT_SAFE = splitSafe({ token: "AFE", logprob: 0 }, { token: "<|im_end|>", logprob: 0 })
+
+/** The same model's RISKY for `curl … | sh`: "ĠRIS"+"KY", with "ĠS" at 1% beside it. */
+const REAL_SPLIT_RISKY = [
+  ...SPLIT_KEYWORD,
+  {
+    token: "ĠRIS",
+    logprob: 0,
+    top_logprobs: [
+      { token: "ĠRIS", logprob: 0 },
+      { token: "ĠS", logprob: -4.5 },
+      { token: "ĠRISK", logprob: -10.125 },
+      { token: "ĠRAS", logprob: -13.5 },
+    ],
+  },
+  { token: "KY", logprob: 0 },
+]
+
+describe("verdictConfidence — a SAFE spelled S+AFE", () => {
+  test("the captured split certain-SAFE reads as pSAFE 1.0", () => {
+    const { pSafe, pRisky } = verdictConfidence(REAL_SPLIT_SAFE)
+    expect(pSafe).toBeGreaterThan(0.999)
+    expect(pRisky).toBeLessThan(0.001)
+  })
+  test("the credit is the probability of the spelling, not of the S alone", () => {
+    const { pSafe } = verdictConfidence(splitSafe({ token: "AFE", logprob: -0.1244 }))
+    expect(pSafe).toBeCloseTo(0.883, 3)
+  })
+  test("a spelling over several tokens multiplies them all", () => {
+    const { pSafe } = verdictConfidence(splitSafe({ token: "A", logprob: 0 }, { token: "FE", logprob: -0.1244 }))
+    expect(pSafe).toBeCloseTo(0.883, 3)
+  })
+  test("an S that goes on to another word is not a SAFE vote", () => {
+    expect(verdictConfidence(splitSafe({ token: "AN", logprob: 0 })).pSafe).toBeLessThan(0.001)
+    expect(verdictConfidence(splitSafe({ token: "IS", logprob: 0 })).pSafe).toBeLessThan(0.001)
+  })
+  test("a space inside the spelling breaks it", () => {
+    expect(verdictConfidence(splitSafe({ token: "ĠAFE", logprob: 0 })).pSafe).toBeLessThan(0.001)
+  })
+  test("an answer cut off after the S, or partway through, is not certain", () => {
+    expect(verdictConfidence(splitSafe()).pSafe).toBeLessThan(0.001)
+    expect(verdictConfidence(splitSafe({ token: "AF", logprob: 0 })).pSafe).toBeLessThan(0.001)
+  })
+  test("a continuation without a logprob adds nothing", () => {
+    expect(verdictConfidence(splitSafe({ token: "AFE" })).pSafe).toBeLessThan(0.001)
+  })
+  test("an S alternative beside a chosen RISKY is never counted", () => {
+    const { pSafe, pRisky } = verdictConfidence(REAL_SPLIT_RISKY)
+    expect(pSafe).toBe(0)
+    expect(pRisky).toBeGreaterThan(0.999)
+  })
+  test("the whole-token answer reads exactly as before", () => {
+    // Every "starts with SA" alternative, in fixture order: ĠSAFE, SAFE, ĠSafe,
+    // Ġsafe and ĠSAVE (which that test has always counted); "_SAFE" never.
+    const { pSafe } = verdictConfidence(REAL_CERTAIN_SAFE)
+    expect(pSafe).toBe([0, -11.75, -13, -13.5625, -14.6875].reduce((a, l) => a + Math.exp(l), 0))
+  })
+})
+
 describe("stage 1 — the rules short-circuit", () => {
   test("a rule hit is the verdict, and no request is made at all", async () => {
     const { calls, fetchImpl } = recorder({})

@@ -1332,6 +1332,9 @@ function sessionLadder(first, kind, pool) {
  * they are not a distribution and pRisky has been measured at 1.0000033, so
  * never treat them as summing to one.
  *
+ * Some tokenizers put the whole choice on a bare "S" and spell the rest after
+ * it, which "starts with SA" cannot see — see `spelledSafe`.
+ *
  * Missing, malformed or absent logprobs give {null, null}, which reads as "not
  * certain" everywhere and sends the command on to the next stage.
  */
@@ -1349,7 +1352,33 @@ function verdictConfidence(content) {
   if (!tl) return { pSafe: null, pRisky: null }
   const norm = (s) => String(s ?? "").replace(/^[\u0120\u2581\s]+/, "").toUpperCase()
   const p = (pred) => tl.reduce((a, t) => (pred(norm(t?.token)) && Number.isFinite(t?.logprob) ? a + Math.exp(t.logprob) : a), 0)
-  return { pSafe: p((t) => t.startsWith("SA")), pRisky: p((t) => t.startsWith("R")) }
+  return { pSafe: p((t) => t.startsWith("SA")) + spelledSafe(toks, vi, norm), pRisky: p((t) => t.startsWith("R")) }
+}
+
+/**
+ * The probability of a SAFE the model spelled "S"+"AFE", read along the tokens
+ * it actually produced.
+ *
+ * MiniCPM5-2B (captured 2026-09-14) answers `git status` with "ĠS" then "AFE",
+ * both at logprob 0, and "starts with SA" read that clean SAFE as pSAFE 7e-8.
+ * A bare "S" is not a SAFE vote on its own: the same position offers "ĠSIS",
+ * "ĠSAN" and "ĠUNS". So it counts only when the CHOSEN verdict token is "S" and
+ * the tokens right after it spell the rest of "SAFE" with nothing between
+ * them, and the credit is the product of their probabilities. That is the
+ * probability of this one spelling — a lower bound on SAFE, never more.
+ * Anything else, a space or a cut-off answer included, adds nothing.
+ */
+function spelledSafe(toks, vi, norm) {
+  if (norm(toks[vi]?.token) !== "S" || !Number.isFinite(toks[vi]?.logprob)) return 0
+  let spelled = "S"
+  let logprob = toks[vi].logprob
+  for (let k = vi + 1; k < toks.length && spelled !== "SAFE"; k++) {
+    const t = typeof toks[k]?.token === "string" ? toks[k].token.toUpperCase() : ""
+    if (t === "" || !"SAFE".startsWith(spelled + t) || !Number.isFinite(toks[k]?.logprob)) return 0
+    spelled += t
+    logprob += toks[k].logprob
+  }
+  return spelled === "SAFE" ? Math.exp(logprob) : 0
 }
 
 /**

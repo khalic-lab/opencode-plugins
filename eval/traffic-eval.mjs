@@ -15,11 +15,14 @@ const { resolveConfig, parseVerdict, verdictConfidence, BASH_SYSTEM_PROMPT, buil
 
 // Stage 2's request, byte for byte the body classifyRequest sends (non-streaming,
 // logprobs, top 8), asked directly so the verdict-token confidence can be read in a
-// tokenizer-independent way. The plugin's verdictConfidence matches alternatives
-// that START WITH "SA", which misses tokenizers that split the word as "S"+"AFE"
-// (Ministral's tekken, measured 2026-09-14: a clean SAFE read as pSafe 0.0002).
-// Here an alternative counts for SAFE when it is a non-empty prefix of "SAFE" or
-// starts with "SA" (same for RISKY). pSafeProd keeps the plugin's own number.
+// tokenizer-independent way. The plugin's verdictConfidence used to match only
+// alternatives that START WITH "SA", missing tokenizers that split the word as
+// "S"+"AFE" (Ministral's tekken, measured 2026-09-14: a clean SAFE read as pSafe
+// 0.0002); it now credits that spelling along the tokens actually produced.
+// Here, more loosely, an alternative counts for SAFE when it is a non-empty
+// prefix of "SAFE" or starts with "SA" (same for RISKY) — which also counts an
+// "S" that was going to be another word, so treat this as an upper bound.
+// pSafeProd keeps the plugin's own number.
 function tolerantConfidence(content) {
   const toks = Array.isArray(content) ? content : null
   if (!toks) return { pSafe: null, pRisky: null }
