@@ -173,10 +173,13 @@ check "shadow survives that crash"    0 shadow  "$(payload Bash '{"command":"git
 # Unreachable model server: endpoint lives in the opencode user file, which the
 # hook reads through resolveConfig({worktree:null}).
 echo '{"endpoint":"http://127.0.0.1:9/v1","timeoutMs":2000}' > "$H/.config/opencode/local-classifier.json"
+# Same reason as openbreaker: a cached verdict would answer without ever
+# reaching the unreachable address.
+rm -f "$H/.local/state/cc-local-classifier/verdicts.json"
 check "classifier unreachable denied" 2 enforce "$(payload Bash '{"command":"git status"}')"
 check "...and shadow still passes"    0 shadow  "$(payload Bash '{"command":"git status"}')"
 rm -f "$H/.config/opencode/local-classifier.json"
-rm -f "$H/.local/state/cc-local-classifier/breaker.json"
+rm -f "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 
 echo "== watchdog: a wedged pipe must not hang =="
 # stdin that never closes is exactly the case the harness `timeout` would
@@ -223,13 +226,17 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TMP/hang.port" ] && break; python3 -c '
 HPORT="$(cat "$TMP/hang.port")"
 echo "{\"endpoint\":\"http://127.0.0.1:$HPORT/v1\",\"timeoutMs\":1500}" > "$H/.config/opencode/local-classifier.json"
 echo '{"deadlineMs":4000}' > "$H/.config/cc-local-classifier/config.json"
+# The real-model section above answers this very subject and caches it. A
+# cache hit would allow before the hanging endpoint is ever dialled, and the
+# timeout this block exists to test would never happen.
+rm -f "$H/.local/state/cc-local-classifier/verdicts.json"
 POSTURE=cascade
 check "hanging classifier passes through"     0 enforce "$(payload Bash '{"command":"git status"}')"
 say   "...silently"                           enforce "$(payload Bash '{"command":"git status"}')" silent
 POSTURE=veto
 check "hanging classifier denies under veto"  2 enforce "$(payload Bash '{"command":"git status"}')"
 kill "$hang" 2>/dev/null; wait "$hang" 2>/dev/null
-rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json"
+rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 echo '{}' > "$H/.config/cc-local-classifier/config.json"
 
 echo "== an empty cwd is not a project boundary =="
@@ -245,9 +252,10 @@ say   "...built-in classifier decides"    enforce "$(payload Bash '{"command":"r
 say   "shadow: safe says nothing"         shadow  "$(payload Bash '{"command":"git status"}')" silent
 check "path rule still denies"            2 enforce "$(payload Write '{"file_path":"~/.zshrc","content":"x"}')"
 echo '{"endpoint":"http://127.0.0.1:9/v1","timeoutMs":2000}' > "$H/.config/opencode/local-classifier.json"
+rm -f "$H/.local/state/cc-local-classifier/verdicts.json"
 check "classifier unreachable passes through" 0 enforce "$(payload Bash '{"command":"git status"}')"
 say   "...silently"                       enforce "$(payload Bash '{"command":"git status"}')" silent
-rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json"
+rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 check "hook crash still denies (a bug is loud)" 2 enforce "$(payload Bash '{"command":"git status"}')" \
       CC_CLASSIFIER_MODULE=/nonexistent/module.js
 # No posture anywhere (no env, {} config): the default must be cascade.
@@ -294,7 +302,11 @@ POSTURE=veto
 echo "== breaker open: the policy applies under veto, cascade passes regardless =="
 STATE="$H/.local/state/cc-local-classifier"; mkdir -p "$STATE"
 NOW="$(python3 -c 'import time;print(int(time.time()*1000))')"
-openbreaker() { printf '{"consecutiveFailures":3,"openedAt":%s}' "$1" > "$STATE/breaker.json"; }
+# The verdict cache answers before the breaker is consulted (a rules or cache
+# hit needs no model, so model availability does not apply to it). A scenario
+# that fakes an open breaker therefore has to empty the cache too, or an
+# earlier scenario's SAFE for the same command decides this one.
+openbreaker() { printf '{"consecutiveFailures":3,"openedAt":%s}' "$1" > "$STATE/breaker.json"; rm -f "$STATE/verdicts.json"; }
 POSTURE=veto
 openbreaker "$NOW"
 say   "veto, policy deny: denied"          enforce "$(payload Bash '{"command":"git status"}')" deny
@@ -309,7 +321,7 @@ say   "cascade, policy deny: says nothing" enforce "$(payload Bash '{"command":"
 # open: the model is consulted, git status is SAFE, cascade claims it.
 openbreaker "$((NOW + 1000000000))"
 say   "future openedAt is not open"        enforce "$(payload Bash '{"command":"git status"}')" allow
-rm -f "$STATE/breaker.json"
+rm -f "$STATE/breaker.json" "$STATE/verdicts.json"
 POSTURE=veto
 
 # timed <name> <want-exit> <mode> <stdin> <max-ms> [env KEY=VAL ...]
@@ -350,7 +362,7 @@ busy=$!
 for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$TMP/busy.port" ] && break; python3 -c 'import time;time.sleep(0.1)'; done
 BPORT="$(cat "$TMP/busy.port")"
 settle_workers
-rm -rf "$LOGDIR" "$H/.local/state/cc-local-classifier/breaker.json"
+rm -rf "$LOGDIR" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 echo "{\"endpoint\":\"http://127.0.0.1:$BPORT/v1\",\"timeoutMs\":2000}" > "$H/.config/opencode/local-classifier.json"
 POSTURE=cascade
 timed "busy: cascade passes at once"          0 enforce "$(payload Bash '{"command":"git status"}')" 3000
@@ -364,11 +376,11 @@ echo '{}' > "$H/.config/cc-local-classifier/config.json"
 # own timeout lands — the pre-probe behaviour, still available.
 timed "probe off: waits for the model"        2 enforce "$(payload Bash '{"command":"git status"}')" 6000 CC_CLASSIFIER_BUSY_PROMPT_TOKENS=0
 settle_workers
-logcheck "busy is logged as a skip"           '"skipped":"busy"'
+logcheck "busy is logged as unjudged"        '"outcome":"unjudged".*"unjudged_why":"busy"'
 logcheck "...with the request it saw"         '"prompt_tokens":52000'
 logcheck "busy is its own failure kind"       '"failure":"busy"'
 kill "$busy" 2>/dev/null; wait "$busy" 2>/dev/null
-rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json"
+rm -f "$H/.config/opencode/local-classifier.json" "$H/.local/state/cc-local-classifier/breaker.json" "$H/.local/state/cc-local-classifier/verdicts.json"
 
 echo "== detached shadow: the hook is gone before the model answers =="
 # Hermetic: a server whose flight list is empty and whose completions answer
@@ -397,16 +409,18 @@ settle_workers
 rm -rf "$LOGDIR"
 echo "{\"endpoint\":\"http://127.0.0.1:$CPORT/v1\",\"timeoutMs\":4000}" > "$H/.config/opencode/local-classifier.json"
 POSTURE=cascade
-timed "shadow exits before the verdict"       0 shadow "$(payload Bash '{"command":"echo detached-probe"}')" 1500
-say   "...and says nothing"                   shadow "$(payload Bash '{"command":"echo detached-probe"}')" silent
-timed "shadow blocks when asked to"           0 shadow "$(payload Bash '{"command":"echo blocking-probe"}')" 6000 CC_CLASSIFIER_SHADOW_DETACHED=0
+timed "shadow exits before the verdict"       0 shadow "$(payload Bash '{"command":"git log --oneline -1 detached-probe"}')" 1500
+say   "...and says nothing"                   shadow "$(payload Bash '{"command":"git log --oneline -1 detached-probe"}')" silent
+timed "shadow blocks when asked to"           0 shadow "$(payload Bash '{"command":"git log --oneline -1 blocking-probe"}')" 6000 CC_CLASSIFIER_SHADOW_DETACHED=0
 settle_workers
-logcheck "parent logs the dispatch"           '"event":"classification.dispatched".*"subject":"echo detached-probe"'
-logcheck "detached row is the worker's"       '"subject":"echo detached-probe".*"via":"worker-detached"'
-logcheck "detached action is would_allow"     '"decided":"would_allow".*"detached":true'
+# Schema 2 shrank the parent row to join keys: the subject travels on the
+# worker's decision row, so the dispatch row is matched by its digest.
+logcheck "parent logs the dispatch"           '"event":"dispatch"'
+logcheck "detached row is the worker's"       '"subject":"git log --oneline -1 detached-probe".*"via":"worker-detached"'
+logcheck "detached row carries the intent"    '"decided":"would_allow".*"detached":true'
 logcheck "the probe was free, and says so"    '"probe":"free"'
-logcheck "blocking row is the hook's"         '"subject":"echo blocking-probe".*"via":"worker"'
-lognone  "blocking row is not detached"       '"subject":"echo blocking-probe".*"via":"worker-detached"'
+logcheck "blocking row is the hook's"         '"subject":"git log --oneline -1 blocking-probe".*"via":"worker"'
+lognone  "blocking row is not detached"       '"subject":"git log --oneline -1 blocking-probe".*"via":"worker-detached"'
 kill "$canned" 2>/dev/null; wait "$canned" 2>/dev/null
 rm -f "$H/.config/opencode/local-classifier.json"
 
@@ -424,8 +438,12 @@ say   "...and a would-be deny"                shadow "$(payload Bash '{"command"
 rm -f "$H/.config/opencode/local-classifier.json"
 settle_workers
 logcheck "rows carry mode:shadow"                '"mode":"shadow"'
-logcheck "the worker's tail row landed"          '"event":"classification.tail"'
-lognone  "no tail row contradicts its verdict"   '"contradicted":true'
+# Schema 2 has no tail row: the streamed reason is folded into the one
+# decision row, and the old `contradicted` flag compared the model to
+# itself on the secondary path only — never a correctness signal.
+lognone  "no tail row survives schema 2"         '"event":"classification.tail"'
+lognone  "no legacy classification rows"         '"event":"classification"'
+logcheck "one decision row per call"             '"event":"decision"'
 lognone  "no row claims mode:enforce"            '"mode":"enforce"'
 logcheck "SAFE under cascade logs would_allow"   '"decided":"would_allow"'
 logcheck "RISKY under veto logs would_deny"      '"decided":"would_deny"'

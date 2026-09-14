@@ -219,6 +219,42 @@ Without it the first classification after an eviction prefills the whole
 10 s classifier timeout and returned `failure: "timeout"` — which in enforce
 **denies a command that was never classified**. Warm, the same call is 450–550 ms.
 
+A hosted endpoint (`apiKeyEnv` set) is the exception. Its key usually lives in the
+login shell, which launchd does not run, so the warm job skips and records nothing
+(`"skipped":"no_api_key"`) instead of feeding the breaker failures that say
+nothing about the model. The provider caches the prefix on its own; a cold call
+there measured ~1.1 s against ~0.6 s warm (TensorX, 2026-09-11), not a timeout.
+
+## What never reaches the model
+
+A hook is a fresh process per tool call, so anything it wants to remember goes
+in a file. Two of them sit under `~/.local/state/cc-local-classifier/`, and both
+are read on the **parent's** critical path — before the breaker, before the busy
+probe, before a worker is spawned — because an answer that needs no model does
+not need any of that:
+
+- **the rules**, deterministic and stateless: the RISKY layer, then the
+  inert-reader SAFE layer. 24.6% of real bash traffic over the 2026-09-02..09
+  shadow window, at 0–1 ms.
+- **`verdicts.json`**, an identical `(kind, subject)` model verdict reused for
+  300 s. Subjects are stored as a 16-hex sha, never as text: the log already
+  keeps command text under your own policy, and a second copy elsewhere with a
+  different lifetime is not something to create as a side effect of a cache.
+  Bounded to 200 entries, write-then-rename, and every read and write is
+  best-effort — a cache that cannot remember is the status quo, and that must
+  never be a reason to block a tool call.
+
+Neither consults the breaker, which is deliberate: model availability is not a
+question that applies to an answer the model was not asked for, so a quarter of
+commands keep getting real verdicts straight through an outage.
+
+The exact-match cache cannot do much better than it does. Over that window 7,121
+judged commands contained 6,674 distinct subjects, so reuse tops out near 6%
+whatever the TTL — and no looser key is safe, because every normalization that
+manufactures reuse erases the operand that decides risk. It earns its place on
+*where* the calls are removed from, not how many: the servers behind this answer
+one request at a time.
+
 ## The one decision left: `breakerPolicy`
 
 `createBreaker` held its counter in a closure, which worked because the plugin

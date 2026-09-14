@@ -12,7 +12,7 @@ you — with an explicit pass or fail — whether it has earned the right to ans
 opencode's `permission.ask` plugin hook is declared but never fired ([#7006][7006]), so
 intercepting a prompt before it appears is impossible. Instead this listens to the
 `permission.asked` bus event, classifies the command with a plain HTTP call to a local
-OpenAI-compatible endpoint (a strict two-line `VERDICT: SAFE|RISKY` protocol at temperature
+OpenAI-compatible endpoint (a strict `VERDICT: SAFE|RISKY` protocol — one line for SAFE, a second `REASON:` line for RISKY — at temperature
 0), and — only in enforce mode, only on SAFE, only after a countdown you can beat — replies
 `once`. Everything else, including every failure, leaves the prompt for you.
 
@@ -117,6 +117,8 @@ enforce.
 |---|---|---|
 | `mode` | `"shadow"` | `shadow` / `enforce` / `off` |
 | `endpoint` | `http://127.0.0.1:7777/proxy/qwen38-flash-next-mtplx/v1` | OpenAI-compatible base URL |
+| `apiKeyEnv` | `null` | NAME of an env var holding a bearer token for `endpoint` (a hosted server); sent to `endpoint` only, never to fallbacks or a secondary (a keyed secondary sets its own `cascade.secondary.apiKeyEnv`); unset at call time → `no_api_key`, nothing sent. User file or trusted plugin options only |
+| `endpointFallbacks` | `[]` | more addresses for the same primary, tried in order (below) |
 | `model` | `Youssofal/Qwen3.8-Flash-Next-MTPLX-Bare-Speed` | as your server names it |
 | `timeoutMs` | `10000` | per classification, hard abort |
 | `stream` | `true` | settle on the verdict line while the reason is still being written (below) |
@@ -128,7 +130,7 @@ enforce.
 | `breakerThreshold` / `breakerCooldownMs` | `3` / `60000` | consecutive failures open the breaker |
 | `warmIntervalMs` | `240000` | keeps the model's cached prompt prefix hot; 0 disables |
 | `logDir` | `~/.local/share/opencode-local-classifier/logs` | JSONL, one file per day, `0700`/`0600` |
-| `rules` | `{ "enabled": true }` | stage 1, the deterministic RISKY layer (below) |
+| `rules` | `{ "enabled": true, "inert": true }` | stages 1 and 1b, the deterministic layers (below) |
 | `cascade` | `null` | stages 2 and 3 (below) |
 
 The project file and the plugin options layer are **not** trusted: a repo you clone can
@@ -138,16 +140,34 @@ you genuinely configure this through plugin options.
 
 `rules` and `cascade` are user-file-only for the same reason, one level deeper:
 `cascade.secondary` names the server that decides every command the primary was unsure
-about, `cascade.certain: 0` would make every SAFE certain, and `rules: { enabled: false }`
-would remove the deterministic asks. None of that may come from a checkout.
+about, `cascade.certain: 0` would make every SAFE certain, `rules: { enabled: false }` would
+remove the deterministic asks, and `rules: { inert: true }` would *add* deterministic passes.
+The block is excluded in both directions rather than one, and none of it may come from a
+checkout.
 
-## Three stages
+## Stages
 
-Every classification goes through up to three of them, inside one `timeoutMs`.
+Every classification goes through as many of these as it needs, inside one `timeoutMs`.
+The first three cost nothing — no network, no queue — and settled 24.6% of real bash
+traffic over the 2026-09-02..09 shadow window.
 
-1. **Rules** — `bash-rules.mjs`, deterministic, no model. It only ever says RISKY, so it can
-   only add asks; a hit ends the decision and names the rule. `rules: { enabled: false }`
-   skips it. Bash only: an external-directory subject is a list of paths, not a command.
+1. **Rules (RISKY)** — `bash-rules.mjs`, deterministic, no model. It only ever says RISKY,
+   so it can only add asks; a hit ends the decision and names the rule.
+   `rules: { enabled: false }` skips it. Bash only: an external-directory subject is a list
+   of paths, not a command.
+1b. **Rules (SAFE)** — `inertBashCommand`, the one layer that asserts SAFE without a model.
+   It returns SAFE only when *every* segment of the command resolves to a concrete verb in a
+   short closed set of readers (`cat grep head tail wc ls ps echo …`) and declines on
+   anything it cannot resolve: an unexpanded `$VAR` or glob in any position, a command
+   substitution, a heredoc, a redirect that is not `>/dev/null`, `sudo`, `xargs`, a read
+   under a per-application private-state tree (`~/Library/Application Support` and
+   friends), or a parser exception. It runs only on stage 1's null, so the asks always win —
+   which is what lets `cat` sit in the set while `cat ~/.ssh/id_rsa` stays an ask.
+   `rules: { inert: false }` skips it, at the cost of ~25% more model calls.
+1c. **Verdict cache** — an identical `(kind, subject)` model verdict, reused for 300 s.
+   Consulted *after* both rule layers, never before: the rules `stat` the filesystem, so a
+   cached verdict must not answer for a tree that has changed. Only the model's reading of
+   the command text is reused.
 2. **Primary** — `endpoint`/`model`, asked for the whole answer with `logprobs`, so the
    probability it put on SAFE at the verdict token is readable. A SAFE at or above
    `cascade.certain` ends the decision.
@@ -169,6 +189,21 @@ Every classification goes through up to three of them, inside one `timeoutMs`.
   }
 }
 ```
+
+`endpointFallbacks` lists further addresses for the **same** primary — one server reached
+over more than one network, e.g. a remote box LAN-first with its Tailscale address second.
+The primary stage tries them in order and moves on only when an address fails at transport
+level (timeout, refused or unroutable connection, 5xx, a body that is not the server's
+JSON — a captive portal or a proxy error page); an answer that parsed, certain or not,
+never falls through, because the same server will not answer better elsewhere. Each
+address may spend up to `primaryTimeoutMs`, but a fallback attempt only runs inside what
+the shared budget can spare after 2 s is held back for the secondary — enough for a warm
+decision — so dead addresses degrade stage 3's slice to that reserve, never to zero. When
+more than one address is configured the log's `primary` record gains `endpoint` (the
+address that answered), and once the fallback actually engaged, `attempts` — every address
+tried, with its failure and latency. It is user-file-only like `cascade`, and it applies
+to the cascade's primary stage: the no-cascade path and the startup health probe use
+`endpoint` alone, while warm classifications follow the same fallback path as real ones.
 
 With no `cascade` block it is one model call, exactly as before: streamed, no logprobs field.
 With a `cascade` that has no `secondary`, an uncertain SAFE becomes RISKY

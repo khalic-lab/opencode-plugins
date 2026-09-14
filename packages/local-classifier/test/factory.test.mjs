@@ -86,7 +86,7 @@ const asked = (id) => ({
     type: "permission.asked",
     properties: {
       id, sessionID: "ses_t", permission: "bash",
-      patterns: ["ls"], metadata: { command: "ls ." }, always: [],
+      patterns: ["git"], metadata: { command: "git status ." }, always: [],
     },
   },
 })
@@ -138,7 +138,7 @@ describe("the prompt prefix is kept warm", () => {
     expect(warm.length).toBeGreaterThan(0)
     expect(warm.every((l) => l.ok === false)).toBe(true)
     // Nothing about a failed warm may look like a real classification.
-    expect(readLog().some((l) => l.event === "classification")).toBe(false)
+    expect(readLog().some((l) => l.event === "decision")).toBe(false)
   })
 
   test("a warm is never mistaken for a real classification", async () => {
@@ -148,7 +148,7 @@ describe("the prompt prefix is kept warm", () => {
     })
     await flush(120)
     expect(sent.length).toBeGreaterThan(0)
-    expect(readLog().some((l) => l.event === "classification")).toBe(false)
+    expect(readLog().some((l) => l.event === "decision")).toBe(false)
     expect(readLog().some((l) => l.event === "action")).toBe(false)
   })
 
@@ -181,7 +181,7 @@ describe("plugin factory invariants", () => {
     expect(client.calls.length).toBe(0)
     const log = readLog()
     expect(log.find((l) => l.event === "action")?.decided).toBe("would_approve")
-    expect(log.find((l) => l.event === "classification")?.subject).toBe("ls .")
+    expect(log.find((l) => l.event === "decision")?.subject).toBe("git status .")
   })
 
   test("enforce: SAFE verdict replies exactly 'once' via the SDK client", async () => {
@@ -243,9 +243,9 @@ describe("plugin factory invariants", () => {
     const call = (cmd) => hooks["tool.execute.before"]({ tool: "bash", callID: "c1", sessionID: "s" }, { args: { command: cmd } })
     await expect(call("rm -rf /")).rejects.toThrow(/blocked/)
     globalThis.fetch = mockFetch(new Error("down"))
-    await expect(call("ls")).rejects.toThrow(/fail-closed/)
+    await expect(call("git status")).rejects.toThrow(/fail-closed/)
     globalThis.fetch = mockFetch("VERDICT: SAFE\nREASON: ok")
-    await expect(call("ls")).resolves.toBeUndefined()
+    await expect(call("git status")).resolves.toBeUndefined()
     // mode off is the kill switch for the veto hook too
     globalThis.fetch = mockFetch("VERDICT: RISKY\nREASON: no")
     hooks = await LocalClassifierPlugin(

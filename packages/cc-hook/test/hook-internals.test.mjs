@@ -37,10 +37,12 @@ describe("probeBusy", () => {
   })
   test("short requests in flight are not busy", async () => {
     const f = fakeFetch([{ rid: "a", prompt_tokens: 2400, phase: "decode", elapsed_s: 0.4 }])
-    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), f)).toEqual({ busy: null, probe: "free" })
+    // `inFlight` rides on every probe result, busy or not: the depth is only
+    // useful if it is recorded for the calls that RAN.
+    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), f)).toEqual({ busy: null, probe: "free", inFlight: 1 })
   })
   test("nothing in flight is not busy", async () => {
-    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), fakeFetch([]))).toEqual({ busy: null, probe: "free" })
+    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), fakeFetch([]))).toEqual({ busy: null, probe: "free", inFlight: 0 })
   })
   test("the threshold is the config's", async () => {
     const f = fakeFetch([{ prompt_tokens: 7000 }])
@@ -72,7 +74,7 @@ describe("probeBusy", () => {
     expect(called).toBe(false)
   })
   test("a failing, missing or malformed endpoint is never busy, and says why", async () => {
-    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), fakeFetch([], { throws: true }))).toEqual({ busy: null, probe: "unavailable:Error" })
+    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), fakeFetch([], { throws: true }))).toEqual({ busy: null, probe: "unavailable:Error", inFlight: null })
     const notFound = async () => ({ ok: false, status: 404 })
     expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg(), notFound)).toEqual({ busy: null, probe: "unavailable:http_404" })
     const junk = async () => ({ ok: true, json: async () => "not an object" })
@@ -83,7 +85,7 @@ describe("probeBusy", () => {
   test("a probe that hangs is abandoned inside busyProbeMs", async () => {
     const hang = (url, { signal }) => new Promise((_, reject) => { signal.addEventListener("abort", () => reject(signal.reason)) })
     const t = Date.now()
-    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg({ busyProbeMs: 50 }), hang)).toEqual({ busy: null, probe: "unavailable:timeout" })
+    expect(await H.probeBusy({ endpoint: "http://x/v1" }, cfg({ busyProbeMs: 50 }), hang)).toEqual({ busy: null, probe: "unavailable:timeout", inFlight: null })
     expect(Date.now() - t).toBeLessThan(1000)
   })
 })
@@ -108,6 +110,17 @@ describe("loadBreaker — file-backed, with backoff", () => {
     expect(H.loadBreaker(c(dir), now).open).toBe(true)
     t += 1
     expect(H.loadBreaker(c(dir), now).open).toBe(false)
+  })
+  test("no_api_key is booked as nothing: neither opens nor closes the shared breaker", () => {
+    const dir = fresh()
+    const now = () => 1_000_000
+    H.loadBreaker(c(dir), now).record(true)
+    H.loadBreaker(c(dir), now).record(true)
+    for (let i = 0; i < 5; i++) {
+      expect(H.recordOutcome(H.loadBreaker(c(dir), now), { failure: "no_api_key" }).openedAt).toBe(0)
+    }
+    expect(H.loadBreaker(c(dir), now).state.consecutiveFailures).toBe(2) // not reset, not advanced
+    expect(H.recordOutcome(H.loadBreaker(c(dir), now), { failure: "timeout" }).openedAt).toBe(1_000_000)
   })
   test("each re-open without a success doubles the cooldown, up to the cap", () => {
     const dir = fresh()
@@ -317,5 +330,98 @@ describe("ask-then-remember", () => {
 
   test("outsideProjectAction only accepts deny or ask", () => {
     expect(H.HOOK_DEFAULTS.outsideProjectAction).toBe("deny")
+  })
+})
+
+describe("the file-backed verdict cache", () => {
+  const I = LocalClassifier.internals
+  const freshCfg = () => cfg({ stateDir: fs.mkdtempSync(path.join(os.tmpdir(), "cc-vcache-")) })
+
+  test("a verdict written by one process is read by the next", () => {
+    // The whole reason this is on disk. The plugin holds the identical shape
+    // in a closure because it is one long-lived process; a hook is a fresh
+    // process per tool call, so an in-process Map would never see a hit.
+    const c = freshCfg()
+    const writer = H.loadVerdictCache(c, I)
+    writer.put(I.cacheKey("bash", "git status"), { verdict: "SAFE", reason: "ok" })
+
+    const reader = H.loadVerdictCache(c, I)
+    expect(reader.get(I.cacheKey("bash", "git status"))).toMatchObject({ verdict: "SAFE", reason: "ok" })
+    expect(reader.get(I.cacheKey("bash", "git diff"))).toBeNull()
+    expect(reader.get(I.cacheKey("external_directory", "git status"))).toBeNull()
+  })
+
+  test("the file holds hashes, never command text", () => {
+    // The log already keeps command text under the user's own policy. A cache
+    // is state; a second copy of every command in another place with another
+    // lifetime is not something to create as a side effect.
+    const c = freshCfg()
+    const cache = H.loadVerdictCache(c, I)
+    cache.put(I.cacheKey("bash", "curl https://api.example.com -H 'Authorization: Bearer sk-live-42'"), { verdict: "SAFE" })
+
+    const raw = fs.readFileSync(cache.file, "utf8")
+    expect(raw).not.toContain("sk-live-42")
+    expect(raw).not.toContain("curl")
+    expect(Object.keys(JSON.parse(raw).entries)[0]).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  test("the stored value is the reduced shape, not the whole result", () => {
+    const c = freshCfg()
+    const cache = H.loadVerdictCache(c, I)
+    cache.put(I.cacheKey("bash", "x"), {
+      verdict: "SAFE", reason: "ok", raw: "VERDICT: SAFE\nREASON: ok",
+      latencyMs: 900, cascadeMs: 900, rest: null, stage: "primary",
+    })
+    const got = cache.get(I.cacheKey("bash", "x"))
+    expect(got.raw).toBeNull()
+    expect(got.latencyMs).toBeNull()
+    expect(got.stage).toBe("primary")
+  })
+
+  test("an entry past the TTL is not returned", () => {
+    const c = freshCfg()
+    let t = 1_000_000
+    const cache = H.loadVerdictCache(c, I, () => t)
+    cache.put(I.cacheKey("bash", "x"), { verdict: "SAFE" })
+    expect(cache.get(I.cacheKey("bash", "x"))).not.toBeNull()
+    t += I.SUBJECT_CACHE_TTL_MS + 1
+    expect(cache.get(I.cacheKey("bash", "x"))).toBeNull()
+  })
+
+  test("the file is bounded, newest kept", () => {
+    const c = freshCfg()
+    let t = 1_000_000
+    const cache = H.loadVerdictCache(c, I, () => t)
+    for (let i = 0; i < I.SUBJECT_CACHE_MAX + 10; i++) {
+      t += 1
+      cache.put(I.cacheKey("bash", `cmd ${i}`), { verdict: "SAFE" })
+    }
+    expect(Object.keys(JSON.parse(fs.readFileSync(cache.file, "utf8")).entries)).toHaveLength(I.SUBJECT_CACHE_MAX)
+    expect(cache.get(I.cacheKey("bash", "cmd 0"))).toBeNull()
+    expect(cache.get(I.cacheKey("bash", `cmd ${I.SUBJECT_CACHE_MAX + 9}`))).not.toBeNull()
+  })
+
+  test("a corrupt, foreign or missing file reads as empty and never throws", () => {
+    // Same policy as the breaker: a cache that cannot remember is the status
+    // quo, and that must never be a reason to block a tool call or crash.
+    const c = freshCfg()
+    const cache = H.loadVerdictCache(c, I)
+    expect(cache.get(I.cacheKey("bash", "x"))).toBeNull() // no file yet
+
+    fs.mkdirSync(c.stateDir, { recursive: true })
+    for (const body of ["{not json", "[]", '{"schema":99,"entries":{"a":1}}', '{"entries":null}']) {
+      fs.writeFileSync(cache.file, body)
+      expect(cache.get(I.cacheKey("bash", "x"))).toBeNull()
+    }
+    // ...and a put over a corrupt file repairs it rather than propagating.
+    fs.writeFileSync(cache.file, "{not json")
+    cache.put(I.cacheKey("bash", "x"), { verdict: "SAFE" })
+    expect(cache.get(I.cacheKey("bash", "x"))?.verdict).toBe("SAFE")
+  })
+
+  test("an unwritable state dir is survivable", () => {
+    const cache = H.loadVerdictCache(cfg({ stateDir: "/proc/nonexistent/nope" }), I)
+    expect(() => cache.put(I.cacheKey("bash", "x"), { verdict: "SAFE" })).not.toThrow()
+    expect(cache.get(I.cacheKey("bash", "x"))).toBeNull()
   })
 })

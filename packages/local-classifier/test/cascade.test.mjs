@@ -259,7 +259,7 @@ describe("stage 2 — the primary and its confidence", () => {
       [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: read-only"),
       [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]),
     })
-    const r = await classify({ kind: "bash", subject: "cat /etc/hosts", config: withCascade(), projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "sed -n 1,5p /etc/hosts", config: withCascade(), projectDir: PROJ, fetchImpl })
     expect(calls.length).toBe(2)
     expect(r.stage).toBe("secondary")
     expect(r.primary.pSafe).toBeNull()
@@ -283,7 +283,7 @@ describe("stage 2 — the primary and its confidence", () => {
       [PRIMARY_HOST]: jsonAnswer("I think this is fine!"),
       [SECONDARY_HOST]: sseAnswer(["VERDICT: RISKY\n", "REASON: unclear"]),
     })
-    const r = await classify({ kind: "bash", subject: "ls", config: withCascade(), projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
     expect(calls.length).toBe(2)
     expect(r.primary.failure).toBe("malformed_output")
     expect(r.verdict).toBe("RISKY")
@@ -294,11 +294,239 @@ describe("stage 2 — the primary and its confidence", () => {
       [PRIMARY_HOST]: () => { throw new Error("ECONNREFUSED") },
       [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]),
     })
-    const r = await classify({ kind: "bash", subject: "ls", config: withCascade(), projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
     expect(calls.length).toBe(2)
     expect(r.primary.failure).toMatch(/^fetch_error:/)
     expect(r.verdict).toBe("SAFE")
     expect(r.stage).toBe("secondary")
+  })
+})
+
+describe("stage 2 — endpointFallbacks: the same primary at more addresses", () => {
+  const LAN = "http://192.168.50.16:8080/v1"
+  const TS = "http://100.103.38.78:8080/v1"
+  const withFallback = (over = {}) => ({ ...withCascade(over), endpoint: LAN, endpointFallbacks: [TS] })
+
+  test("an unreachable first address falls through, and the record names the one that answered", async () => {
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": () => { throw new Error("connect EHOSTUNREACH 192.168.50.16:8080") },
+      "100.103.38.78": jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl })
+    expect(calls.length).toBe(2)
+    expect(r.verdict).toBe("SAFE")
+    expect(r.stage).toBe("primary")
+    expect(r.primary.endpoint).toBe(TS)
+  })
+
+  test("a timeout does NOT move on — a busy server is not an unreachable address", async () => {
+    // The shadow window of 2026-09-06..09: both addresses were routes to one
+    // mlx_lm process, so a timeout at the first meant BUSY and the retry
+    // asked the same saturated server again — 1,533 double-timeouts, and the
+    // secondary starved to its 2 s floor. The second address is never tried.
+    const hang = (_body, init) => new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => { const e = new Error("aborted"); e.name = "AbortError"; reject(e) })
+    })
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": hang,
+      "100.103.38.78": jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: second opinion"]),
+    })
+    const config = { ...withFallback({ primaryTimeoutMs: 150 }), timeoutMs: 3000 }
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl })
+    expect(calls.some((c) => c.url.includes("100.103.38.78"))).toBe(false)
+    expect(r.primary.failure).toBe("timeout")
+    // The whole point of not retrying: stage 3 still has budget and decides.
+    expect(r.stage).toBe("secondary")
+    expect(r.verdict).toBe("SAFE")
+  })
+
+  test("a 5xx falls through; a 4xx does not — that server answers the same at every address", async () => {
+    // 502, not 503. A 503 on this fleet means "busy, retry" and is handled as
+    // a load signal in its own describe block below; 502 is the proxy/crashed
+    // -worker case a second route can genuinely fix.
+    const five = recorder({
+      "192.168.50.16": { ok: false, status: 502, headers: new Headers() },
+      "100.103.38.78": jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl: five.fetchImpl })
+    expect(r.primary.endpoint).toBe(TS)
+    expect(r.verdict).toBe("SAFE")
+
+    const four = recorder({
+      "192.168.50.16": { ok: false, status: 404, headers: new Headers() },
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]),
+    })
+    const r2 = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl: four.fetchImpl })
+    expect(four.calls.some((c) => c.url.includes("100.103.38.78"))).toBe(false)
+    expect(r2.primary.failure).toBe("http_404")
+    expect(r2.stage).toBe("secondary")
+  })
+
+  test("a malformed answer does not fall through — a different address will not parse better", async () => {
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": jsonAnswer("no verdict here"),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: RISKY\n", "REASON: because"]),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl })
+    expect(calls.some((c) => c.url.includes("100.103.38.78"))).toBe(false)
+    expect(r.primary.failure).toBe("malformed_output")
+    expect(r.stage).toBe("secondary")
+    expect(r.verdict).toBe("RISKY")
+  })
+
+  test("an uncertain SAFE does not fall through either — it is an answer, and the secondary's case", async () => {
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": jsonAnswer("VERDICT: SAFE\nREASON: fine", UNCERTAIN_SAFE),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: RISKY\n", "REASON: second opinion"]),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl })
+    expect(calls.some((c) => c.url.includes("100.103.38.78"))).toBe(false)
+    expect(r.stage).toBe("secondary")
+    expect(r.verdict).toBe("RISKY")
+  })
+
+  test("blackholing addresses cannot starve the secondary — 2 s stays reserved, and the row keeps every attempt", async () => {
+    // Injected clock: each primary attempt eats its whole slice. With two
+    // fallbacks and no reserve, stage 2 would spend 3 × 4000 of the 10 000
+    // budget and stage 3 would never run (`secondary_no_budget`).
+    let clock = 0
+    const now = () => clock
+    // A transport failure, not a timeout — since 2026-09-09 only these move
+    // the primary along, so only these can spend the budget on N addresses.
+    const eat = (ms) => () => { clock += ms; throw new Error("connect EHOSTUNREACH") }
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": eat(4000),
+      "100.103.38.78": eat(4000),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]),
+    })
+    const config = { ...withFallback(), endpointFallbacks: [TS, "http://100.103.38.79:8080/v1"] }
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl, now })
+    // Two primary attempts, then the loop stops: 10000 − 8000 leaves exactly
+    // the reserve, so the third address is never tried and the secondary runs.
+    expect(calls.filter((c) => c.url.includes("8080")).length).toBe(2)
+    expect(r.stage).toBe("secondary")
+    expect(r.verdict).toBe("SAFE")
+    expect(r.primary.attempts).toEqual([
+      { endpoint: LAN, failure: "fetch_error:connect EHOSTUNREACH", latencyMs: 4000 },
+      { endpoint: TS, failure: "fetch_error:connect EHOSTUNREACH", latencyMs: 4000 },
+    ])
+    expect(r.primary.endpoint).toBe(TS)
+  })
+
+  test("a timeout DOES move on when the next address declares itself a separate failure domain", async () => {
+    // The ANE backend is a different machine's runtime on the same host: a
+    // wedged remote answers TCP and hangs, so it fails as a timeout, and that
+    // is exactly the case the local backend exists to catch. Opt-in per
+    // address, because two routes to ONE server must keep the old behaviour.
+    const hang = (_body, init) => new Promise((_, reject) => {
+      init.signal.addEventListener("abort", () => { const e = new Error("aborted"); e.name = "AbortError"; reject(e) })
+    })
+    const ANE = "http://127.0.0.1:8123/v1"
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": hang,
+      "127.0.0.1:8123": jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE),
+    })
+    const config = {
+      ...withCascade({ primaryTimeoutMs: 150 }), timeoutMs: 3000, endpoint: LAN,
+      endpointFallbacks: [{ endpoint: ANE, onTimeout: true, timeoutMs: 400 }],
+    }
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl })
+    expect(calls.some((c) => c.url.includes("8123"))).toBe(true)
+    expect(r.stage).toBe("primary")
+    expect(r.primary.endpoint).toBe(ANE)
+    expect(r.primary.attempts.map((a) => a.failure)).toEqual(["timeout", null])
+  })
+
+  test("an address that does not serve this kind is never tried — an unanchored prompt would run cold", async () => {
+    const ANE = "http://127.0.0.1:8123/v1"
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": () => { throw new Error("connect EHOSTUNREACH") },
+      "127.0.0.1:8123": jsonAnswer("VERDICT: SAFE\nREASON: fine", REAL_CERTAIN_SAFE),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: second opinion"]),
+    })
+    const config = {
+      ...withCascade(), endpoint: LAN,
+      endpointFallbacks: [{ endpoint: ANE, onTimeout: true, kinds: ["bash"] }],
+    }
+    const r = await classify({ kind: "external_directory", subject: "/etc", config, projectDir: PROJ, fetchImpl })
+    expect(calls.some((c) => c.url.includes("8123"))).toBe(false)
+    expect(r.stage).toBe("secondary")
+  })
+
+  test("a per-address timeoutMs overrides the shared primary budget", async () => {
+    let clock = 0
+    const now = () => clock
+    const eat = (ms) => () => { clock += ms; const e = new Error("slow"); e.name = "AbortError"; throw e }
+    const ANE = "http://127.0.0.1:8123/v1"
+    const { fetchImpl } = recorder({
+      "192.168.50.16": eat(3000),
+      "127.0.0.1:8123": eat(4500),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: second opinion"]),
+    })
+    const config = {
+      ...withCascade({ primaryTimeoutMs: 3000 }), timeoutMs: 10_000, endpoint: LAN,
+      endpointFallbacks: [{ endpoint: ANE, onTimeout: true, timeoutMs: 4500 }],
+    }
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl, now })
+    // 3000 remote + 4500 ANE = 7500, leaving 2500 — more than the 2 s reserve,
+    // so stage 3 still runs. The ANE got 4500, not the shared 3000.
+    expect(r.primary.attempts.map((a) => a.latencyMs)).toEqual([3000, 4500])
+    expect(r.stage).toBe("secondary")
+  })
+
+  test("a 200 whose body cannot be read is the address's failure — a captive portal, not the model", async () => {
+    const { fetchImpl } = recorder({
+      "192.168.50.16": {
+        ok: true, status: 200, headers: new Headers({ "content-type": "text/html" }),
+        json: async () => { throw new Error("Unexpected token '<'") },
+      },
+      "100.103.38.78": jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl })
+    expect(r.verdict).toBe("SAFE")
+    expect(r.stage).toBe("primary")
+    expect(r.primary.endpoint).toBe(TS)
+  })
+
+  test("every address dead → the secondary still decides", async () => {
+    const { calls, fetchImpl } = recorder({
+      "192.168.50.16": () => { throw new Error("ECONNREFUSED") },
+      "100.103.38.78": () => { throw new Error("ECONNREFUSED") },
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withFallback(), projectDir: PROJ, fetchImpl })
+    expect(calls.length).toBe(3)
+    expect(r.stage).toBe("secondary")
+    expect(r.verdict).toBe("SAFE")
+    expect(r.primary.failure).toMatch(/^fetch_error:/)
+  })
+
+  test("no fallbacks configured: the primary record carries no endpoint column", async () => {
+    const { fetchImpl } = recorder({
+      [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE),
+    })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
+    expect(r.primary.endpoint).toBeUndefined()
+  })
+
+  test("resolveConfig: junk entries are dropped and reported; a non-array whole is dropped", () => {
+    const readFile = (f) => (f.includes(".config/opencode/") ? { endpointFallbacks: [TS, 7, ""] } : null)
+    const { config, problems } = resolveConfig({ readFile, env: {} })
+    // A bare URL normalizes to the conservative address: its own budget
+    // unset, and NOT retried after a timeout.
+    expect(config.endpointFallbacks).toEqual([{ endpoint: TS, model: null, timeoutMs: null, onTimeout: false, kinds: null }])
+    expect(problems.some((p) => /endpointFallbacks/.test(p))).toBe(true)
+    const bad = resolveConfig({ readFile: (f) => (f.includes(".config/opencode/") ? { endpointFallbacks: "not-a-list" } : null), env: {} })
+    expect(bad.config.endpointFallbacks).toEqual([])
+    expect(bad.problems.some((p) => /endpointFallbacks/.test(p))).toBe(true)
+  })
+
+  test("a PROJECT file may not add fallback addresses", () => {
+    const readFile = (f) => (f.startsWith("/w/") ? { endpointFallbacks: ["http://evil/v1"] } : null)
+    const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
+    expect(config.endpointFallbacks).toEqual([])
+    expect(problems.some((p) => /endpointFallbacks/.test(p))).toBe(true)
   })
 })
 
@@ -308,7 +536,7 @@ describe("stage 3 — the secondary decides, and never sees a logprobs field", (
       [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: fine", UNCERTAIN_SAFE),
       [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: fine"]),
     })
-    await classify({ kind: "bash", subject: "ls", config: withCascade(), projectDir: PROJ, fetchImpl })
+    await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
     const sent = calls[1].body
     expect(calls[1].url).toContain(SECONDARY_HOST)
     expect(sent.model).toBe("flash-next")
@@ -323,7 +551,7 @@ describe("stage 3 — the secondary decides, and never sees a logprobs field", (
       [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: fine", UNCERTAIN_SAFE),
       [SECONDARY_HOST]: { ok: false, status: 503 },
     })
-    const r = await classify({ kind: "bash", subject: "ls", config: withCascade(), projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("http_503")
     expect(r.stage).toBe("secondary")
@@ -338,7 +566,7 @@ describe("stage 3 — the secondary decides, and never sees a logprobs field", (
       [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: fine", UNCERTAIN_SAFE),
       [SECONDARY_HOST]: (body) => (("logprobs" in body) ? { ok: false, status: 400 } : sseAnswer(["VERDICT: SAFE\n"])),
     })
-    const r = await classify({ kind: "bash", subject: "ls", config: withCascade(), projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
     expect(r.failure).toBeNull()
     expect(r.verdict).toBe("SAFE")
   })
@@ -354,7 +582,7 @@ describe("the budget is shared, not doubled", () => {
     const { calls, fetchImpl } = recorder({ [PRIMARY_HOST]: hang, [SECONDARY_HOST]: hang })
     const config = { ...withCascade({ primaryTimeoutMs: 150 }), timeoutMs: 400 }
     const t0 = Date.now()
-    const r = await classify({ kind: "bash", subject: "ls", config, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl })
     const elapsed = Date.now() - t0
     expect(calls.length).toBe(2)
     expect(r.primary.failure).toBe("timeout")
@@ -373,7 +601,7 @@ describe("the budget is shared, not doubled", () => {
     const { calls, fetchImpl } = recorder({
       [PRIMARY_HOST]: () => { clock += 11_000; return jsonAnswer("VERDICT: SAFE\nREASON: fine", UNCERTAIN_SAFE) },
     })
-    const r = await classify({ kind: "bash", subject: "ls", config: withCascade(), projectDir: PROJ, fetchImpl, now })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl, now })
     expect(calls.length).toBe(1)
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("secondary_no_budget")
@@ -387,7 +615,7 @@ describe("a cascade with no secondary — confidence alone", () => {
 
   test("an uncertain SAFE becomes RISKY, naming the score", async () => {
     const { calls, fetchImpl } = recorder({ [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: fine", UNCERTAIN_SAFE) })
-    const r = await classify({ kind: "bash", subject: "ls", config: soloCascade, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: soloCascade, projectDir: PROJ, fetchImpl })
     expect(calls.length).toBe(1)
     expect(r.verdict).toBe("RISKY")
     expect(r.reason).toBe("primary not certain (pSAFE=0.88)")
@@ -397,21 +625,21 @@ describe("a cascade with no secondary — confidence alone", () => {
 
   test("a certain SAFE still stands", async () => {
     const { fetchImpl } = recorder({ [PRIMARY_HOST]: jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE) })
-    const r = await classify({ kind: "bash", subject: "ls", config: soloCascade, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: soloCascade, projectDir: PROJ, fetchImpl })
     expect(r.verdict).toBe("SAFE")
     expect(r.reason).toBe("read-only")
   })
 
   test("a RISKY keeps its own reason", async () => {
     const { fetchImpl } = recorder({ [PRIMARY_HOST]: jsonAnswer("VERDICT: RISKY\nREASON: deletes the repo") })
-    const r = await classify({ kind: "bash", subject: "ls", config: soloCascade, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: soloCascade, projectDir: PROJ, fetchImpl })
     expect(r.verdict).toBe("RISKY")
     expect(r.reason).toBe("deletes the repo")
   })
 
   test("a timeout stays a failure — a silent model is not a judgement", async () => {
     const { fetchImpl } = recorder({ [PRIMARY_HOST]: { ok: false, status: 500 } })
-    const r = await classify({ kind: "bash", subject: "ls", config: soloCascade, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: soloCascade, projectDir: PROJ, fetchImpl })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("http_500")
   })
@@ -420,7 +648,7 @@ describe("a cascade with no secondary — confidence alone", () => {
 describe("no cascade block — today's single call, unchanged", () => {
   test("the request is streamed and carries no logprobs field", async () => {
     const { calls, fetchImpl } = recorder({ [PRIMARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]) })
-    const r = await classify({ kind: "bash", subject: "ls -la", config: baseConfig, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status --short", config: baseConfig, projectDir: PROJ, fetchImpl })
     expect(calls.length).toBe(1)
     const sent = calls[0].body
     expect(sent.stream).toBe(true)
@@ -435,12 +663,12 @@ describe("no cascade block — today's single call, unchanged", () => {
     expect(r.stage).toBe("primary")
     expect(r.rule).toBeNull()
     expect(r.secondary).toBeNull()
-    expect(r.primary).toEqual({ verdict: "SAFE", pSafe: null, pRisky: null, latencyMs: r.latencyMs, failure: null })
+    expect(r.primary).toEqual({ verdict: "SAFE", pSafe: null, pRisky: null, latencyMs: r.latencyMs, failure: null, servedModel: null })
   })
 
   test("the streamed result still fills its reason in place when the tail lands", async () => {
     const { fetchImpl } = recorder({ [PRIMARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: read-only"]) })
-    const r = await classify({ kind: "bash", subject: "ls -la", config: baseConfig, projectDir: PROJ, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status --short", config: baseConfig, projectDir: PROJ, fetchImpl })
     // The stage record is stamped on the SAME object the tail completes, or a
     // caller holding the result would never see the reason.
     if (r.rest) await r.rest
@@ -454,7 +682,7 @@ describe("config — only a trusted layer may point the classifier at another se
 
   test("defaults: rules on, no cascade", () => {
     const { config, problems } = resolveConfig({ readFile: noFile, env: {} })
-    expect(config.rules).toEqual({ enabled: true })
+    expect(config.rules).toEqual({ enabled: true, inert: true })
     expect(config.cascade).toBeNull()
     expect(problems).toEqual([])
   })
@@ -475,7 +703,7 @@ describe("config — only a trusted layer may point the classifier at another se
         : null
     const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
     expect(config.cascade).toBeNull()
-    expect(config.rules).toEqual({ enabled: true })
+    expect(config.rules).toEqual({ enabled: true, inert: true })
     expect(problems.some((p) => /project-file may not set cascade/.test(p))).toBe(true)
     expect(problems.some((p) => /project-file may not set rules/.test(p))).toBe(true)
   })
@@ -509,13 +737,13 @@ describe("config — only a trusted layer may point the classifier at another se
   test("rules: {} is not rules off", () => {
     const readFile = (f) => (f.includes(".config/opencode/") ? { rules: {} } : null)
     const { config } = resolveConfig({ readFile, env: {} })
-    expect(config.rules).toEqual({ enabled: true })
+    expect(config.rules).toEqual({ enabled: true, inert: true })
   })
 
   test("rules: { enabled: false } from the user file does turn them off", () => {
     const readFile = (f) => (f.includes(".config/opencode/") ? { rules: { enabled: false } } : null)
     const { config, problems } = resolveConfig({ readFile, env: {} })
-    expect(config.rules).toEqual({ enabled: false })
+    expect(config.rules).toEqual({ enabled: false, inert: true })
     expect(problems).toEqual([])
   })
 })
@@ -535,5 +763,129 @@ describe("the result a config-less caller gets", () => {
     expect(ok.stage).toBe("primary")
     expect(ok.verdict).toBe("SAFE")
     expect(calls.length).toBe(1)
+  })
+})
+
+describe("503 is a load signal, not an address failure", () => {
+  // The remote box moved to the ANE build on 2026-09-09 and answers a
+  // saturated request `503 {"error":"classifier busy, retry"}` in ~44 ms.
+  // That is a busy queue, not an unreachable address: re-asking it at a second
+  // address spends the budget on a question that was already answered.
+  const busy503 = { ok: false, status: 503, headers: new Headers({ "content-type": "application/json" }),
+                    json: async () => ({ error: "classifier busy, retry" }), text: async () => '{"error": "classifier busy, retry"}' }
+
+  test("a 503 does NOT move the primary to its next address", async () => {
+    const { calls, fetchImpl } = recorder({
+      "8199": busy503,
+      "8299": jsonAnswer("VERDICT: SAFE\nREASON: second address", REAL_CERTAIN_SAFE),
+      [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: flash"]),
+    })
+    const config = { ...withCascade(), endpointFallbacks: [{ endpoint: "http://127.0.0.1:8299/v1", model: "m", timeoutMs: null, onTimeout: false, kinds: null }] }
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl })
+    expect(calls.filter((c) => c.url.includes("8299"))).toHaveLength(0)
+    expect(r.stage).toBe("secondary")
+    expect(r.primary.failure).toBe("http_503")
+  })
+
+  test("a 500 still does — that is a crashed worker, and a second route can fix it", async () => {
+    const { calls, fetchImpl } = recorder({
+      "8199": { ok: false, status: 500, headers: new Headers({ "content-type": "text/plain" }), text: async () => "boom" },
+      "8299": jsonAnswer("VERDICT: SAFE\nREASON: second address", REAL_CERTAIN_SAFE),
+    })
+    const config = { ...withCascade(), endpointFallbacks: [{ endpoint: "http://127.0.0.1:8299/v1", model: "m", timeoutMs: null, onTimeout: false, kinds: null }] }
+    const r = await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl })
+    expect(calls.filter((c) => c.url.includes("8299"))).toHaveLength(1)
+    expect(r.stage).toBe("primary")
+    expect(r.verdict).toBe("SAFE")
+  })
+
+  test("asking a busy address is cheap, so the secondary keeps its budget", async () => {
+    const { fetchImpl } = recorder({ "8199": busy503, [SECONDARY_HOST]: sseAnswer(["VERDICT: SAFE\n", "REASON: flash"]) })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
+    expect(r.stage).toBe("secondary")
+    expect(r.verdict).toBe("SAFE")
+  })
+})
+
+describe("cascade.primaryMaxTokens — the primary is asked for a verdict, not an essay", () => {
+  // Stage 2's only unique product is the logprobs at the verdict token; the
+  // reason is stage 3's job. On a slow backend the discarded prose IS the
+  // latency (ANE, 2026-09-08: 1.5-1.9s verdict-only vs 3.85s median full).
+  const capture = () => {
+    const calls = []
+    const fetchImpl = async (url, init) => {
+      const body = JSON.parse(init.body)
+      calls.push({ url, body })
+      if (url.includes(PRIMARY_HOST)) return jsonAnswer("VERDICT: SAFE\nREASON: read-only", REAL_CERTAIN_SAFE)
+      return sseAnswer(["VERDICT: SAFE\n", "REASON: flash"])
+    }
+    return { calls, fetchImpl }
+  }
+
+  test("unset, both stages send the shared maxTokens — nothing changes without opting in", async () => {
+    const { calls, fetchImpl } = capture()
+    await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
+    expect(calls[0].body.max_tokens).toBe(baseConfig.maxTokens)
+  })
+
+  test("set, ONLY the primary is capped — the secondary keeps its budget", async () => {
+    // The secondary must never inherit this: mtplx files a request with
+    // max_tokens <= 48 as a background task and 503s whenever anything else is
+    // generating (46/77 failures, 2026-09-02).
+    const { calls, fetchImpl } = capture()
+    const config = withCascade({ primaryMaxTokens: 16, certain: 1.1 }) // certain > 1 forces stage 3 to run too
+    await classify({ kind: "bash", subject: "git status", config, projectDir: PROJ, fetchImpl })
+    const primary = calls.find((c) => c.url.includes(PRIMARY_HOST))
+    const secondary = calls.find((c) => c.url.includes(SECONDARY_HOST))
+    expect(primary.body.max_tokens).toBe(16)
+    expect(secondary.body.max_tokens).toBe(baseConfig.maxTokens)
+  })
+
+  test("a capped answer still parses — the verdict owns line 1, the reason is optional", async () => {
+    const fetchImpl = async (url) => (url.includes(PRIMARY_HOST)
+      ? jsonAnswer("VERDICT: SAFE\nRE", REAL_CERTAIN_SAFE)
+      : sseAnswer(["VERDICT: RISKY\n", "REASON: must not be reached"]))
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade({ primaryMaxTokens: 16 }), projectDir: PROJ, fetchImpl })
+    expect(r.stage).toBe("primary")
+    expect(r.verdict).toBe("SAFE")
+    expect(r.pSafe).toBeGreaterThan(0.999)
+    expect(r.reason).toBe("")
+  })
+
+  test("a reason the cap cut mid-word is dropped, not shown as a fragment", async () => {
+    // finish_reason "length" says the answer was truncated. "the command o" is
+    // not a reason, and it would reach a human in a toast exactly as it landed.
+    const cut = {
+      ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }),
+      json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: the command o" }, finish_reason: "length", logprobs: { content: REAL_CERTAIN_SAFE } }] }),
+    }
+    const { fetchImpl } = recorder({ [PRIMARY_HOST]: cut })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade({ primaryMaxTokens: 16 }), projectDir: PROJ, fetchImpl })
+    expect(r.verdict).toBe("SAFE")
+    expect(r.reason).toBe("")
+  })
+
+  test("a complete answer keeps its reason — finish_reason 'stop' changes nothing", async () => {
+    const done = {
+      ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }),
+      json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: read-only" }, finish_reason: "stop", logprobs: { content: REAL_CERTAIN_SAFE } }] }),
+    }
+    const { fetchImpl } = recorder({ [PRIMARY_HOST]: done })
+    const r = await classify({ kind: "bash", subject: "git status", config: withCascade(), projectDir: PROJ, fetchImpl })
+    expect(r.reason).toBe("read-only")
+  })
+
+  test("a value that could cut the verdict line itself is refused", () => {
+    const read = (v) => resolveConfig({
+      readFile: (f) => (f.includes(".config/opencode/") ? { cascade: { secondary: SECONDARY, primaryMaxTokens: v } } : null),
+      env: {},
+    })
+    expect(read(16).config.cascade.primaryMaxTokens).toBe(16)
+    expect(read(null).config.cascade.primaryMaxTokens).toBeNull()
+    for (const bad of [7, 0, -1, "16", NaN]) {
+      const { config, problems } = read(bad)
+      expect(config.cascade.primaryMaxTokens).toBeNull()
+      expect(problems.join(" ")).toContain("primaryMaxTokens")
+    }
   })
 })

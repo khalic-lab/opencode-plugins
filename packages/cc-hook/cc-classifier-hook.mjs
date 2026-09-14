@@ -90,7 +90,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const HOOK_NAME = "cc-local-classifier"
-const HOOK_VERSION = "0.5.0"
+const HOOK_VERSION = "0.7.0"
 
 // ---------------------------------------------------------------------------
 // Exit discipline. Only exit 2 denies; everything else approves. These two
@@ -546,7 +546,10 @@ function resolveHookConfig(internals, env = process.env) {
   const base = internals.resolveConfig({ worktree: null, env })
   const problems = [...base.problems]
   const merged = { ...HOOK_DEFAULTS, mode: base.config.mode }
-  const userFile = path.join(os.homedir(), ".config", HOOK_NAME, "config.json")
+  // `env.HOME` first: the same process's HOME in production, and the only way
+  // a caller can point this at another home — Bun's os.homedir() ignores a
+  // HOME changed at runtime.
+  const userFile = path.join(env.HOME || os.homedir(), ".config", HOOK_NAME, "config.json")
   const layer = readJson(userFile)
   if (layer && typeof layer === "object") {
     for (const [k, v] of Object.entries(layer)) {
@@ -669,6 +672,94 @@ function loadBreaker(cfg, now = Date.now) {
   }
 }
 
+/**
+ * Failures that say nothing about the model, so they are not booked at all —
+ * neither as a failure nor as the success that would close the breaker.
+ * `no_api_key` means THIS process lacks the key variable (a cron- or
+ * launchd-started `claude -p`, a session opened from the GUI) while other
+ * sessions have it; the breaker file is shared, so three keyless calls would
+ * otherwise shut the gate for every keyed session too.
+ */
+const BREAKER_BLIND = new Set(["no_api_key"])
+
+/** `breaker.record` for one result, or the unchanged state for a blind failure. */
+function recordOutcome(breaker, result) {
+  if (BREAKER_BLIND.has(result?.failure)) return { ...breaker.state, openedAt: 0 }
+  return breaker.record(Boolean(result?.failure))
+}
+
+// ---------------------------------------------------------------------------
+// File-backed verdict cache. Same reason the breaker is on disk: a hook is a
+// fresh process per tool call, so an in-process Map would never see a second
+// hit. The plugin holds the identical shape in a closure.
+//
+// WHAT IT BUYS, measured. Over 2026-09-02..09 the classifier judged 7,121
+// commands, 6,674 of them distinct — agent-authored command text almost never
+// repeats, so exact matching tops out near 6% of traffic however long the TTL
+// (2.8% at 5 s, 4.7% at 60 s, 5.2% at 300 s, 6.0% at infinity). No looser key
+// is available: every normalization that manufactures reuse erases the operand
+// that decides risk. Replacing paths with a placeholder reaches 24% reuse and
+// puts `rm -rf /tmp/build` and `rm -rf /` on the same key.
+//
+// 5% is worth having anyway because of WHERE it is removed from. The primary
+// is a single-tenant serial mlx_lm.server that this classifier saturates by
+// itself; arrivals it never makes shorten the queue for every call behind
+// them. And this cache is read on the PARENT's critical path, so a hit costs
+// no worker process either.
+//
+// SUBJECTS ARE HASHED, never stored. The log already holds command text under
+// the user's own policy; this file is state, and a second copy of every
+// command in a different place with a different lifetime is not something to
+// create as a side effect of a cache.
+//
+// Failure to read or write is never fatal — a cache that cannot remember is
+// the status quo, and that must not be a reason to block or crash.
+// ---------------------------------------------------------------------------
+
+const VERDICT_CACHE_SCHEMA = 1
+
+function loadVerdictCache(cfg, I, now = Date.now) {
+  const file = path.join(cfg.stateDir, "verdicts.json")
+  const ttlMs = I.SUBJECT_CACHE_TTL_MS
+  const max = I.SUBJECT_CACHE_MAX
+  const read = () => {
+    const raw = readJson(file)
+    return raw && raw.schema === VERDICT_CACHE_SCHEMA && raw.entries && typeof raw.entries === "object"
+      ? raw.entries
+      : {}
+  }
+  return {
+    file,
+    get(key) {
+      try {
+        const hit = read()[I.subjectSha(key)]
+        if (!hit || !Number.isFinite(hit.at) || now() - hit.at > ttlMs) return null
+        return hit.result
+      } catch { return null }
+    },
+    put(key, result) {
+      try {
+        const entries = read()
+        entries[I.subjectSha(key)] = { at: now(), result: I.cacheableResult(result) }
+        // Prune expired first, then oldest-out to the cap. Both here rather
+        // than on read: a reader must stay cheap, and a hook that only ever
+        // reads is a hook that never grows the file anyway.
+        const live = Object.entries(entries)
+          .filter(([, e]) => Number.isFinite(e?.at) && now() - e.at <= ttlMs)
+          .sort((a, b) => b[1].at - a[1].at)
+          .slice(0, max)
+        fs.mkdirSync(cfg.stateDir, { recursive: true, mode: 0o700 })
+        // Write-then-rename: concurrent hooks race here, and a reader must
+        // never see half a file. The loser of a race loses its entry, not the
+        // cache — which is exactly what a cache is allowed to do.
+        const tmp = `${file}.${process.pid}.tmp`
+        fs.writeFileSync(tmp, JSON.stringify({ schema: VERDICT_CACHE_SCHEMA, entries: Object.fromEntries(live) }), { mode: 0o600 })
+        fs.renameSync(tmp, file)
+      } catch {}
+    },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Busy probe. mtplx exposes what it is serving at GET /v1/mtplx/flight; the
 // `active` rows carry prompt_tokens, phase and elapsed_s. One local HTTP call
@@ -717,10 +808,17 @@ async function probeBusy(classifier, cfg, fetchImpl = fetch) {
         }
       }
     }
-    return worst ? { busy: { ...worst, active: active.length }, probe: "busy" } : { busy: null, probe: "free" }
+    // `inFlight` comes back whether or not anything was big enough to skip
+    // for. It was only reported on the skip before, which meant the depth was
+    // recorded exactly when the request did NOT run and was missing for every
+    // request that did — leaving a timeout rate as the only trace of
+    // saturation, which is how the 2026-09-08 outage stayed invisible.
+    return worst
+      ? { busy: { ...worst, active: active.length }, probe: "busy", inFlight: active.length }
+      : { busy: null, probe: "free", inFlight: active.length }
   } catch (e) {
     const why = e?.name === "TimeoutError" || e?.name === "AbortError" ? "timeout" : String(e?.code ?? e?.name ?? "error").slice(0, 40)
-    return { busy: null, probe: `unavailable:${why}` }
+    return { busy: null, probe: `unavailable:${why}`, inFlight: null }
   }
 }
 
@@ -760,20 +858,32 @@ function planFor(result, cfg, riskyPrefix = "classified RISKY") {
   return { outcome: "deny", why: what, extra }
 }
 
-/** The one classification log row, written by whichever process has the result. */
-function logClassification(log, I, base, kind, subject, classifier, result, via, probe = null) {
-  log.log("classification", {
-    ...base, permission: kind, subject,
-    endpoint: classifier.endpoint, model: classifier.model,
-    prompt_version: I.PROMPT_VERSION,
-    verdict: result.verdict, reason: result.reason, failure: result.failure,
-    latency_ms: result.latencyMs, raw_output: I.truncated(result.raw, 4000),
-    session: result.session ?? null, streamed: Boolean(result.streamed), via,
-    // The cascade's stage record, from whichever process holds the result:
-    // the worker sends these back on its decision line, so a row written here
-    // says the same thing as one written there.
-    ...(I.stageFields ? I.stageFields(result) : {}),
-    ...(probe ? { probe } : {}),
+/**
+ * THE row — one per tool call this classifier looked at, written by whichever
+ * process has the result. Schema 2 folds the old `classification` and
+ * `action` rows together: in a hook there is exactly one process, one shot
+ * and one outcome, so two rows only ever meant two denominators to reconcile.
+ *
+ * `decided`/`why` are the gate's intent, which the hook always knows by the
+ * time it writes; `outcome` is what the classifier concluded. They are not
+ * the same field — a RISKY verdict under the cascade posture is
+ * `outcome: "risky"` with `decided: "pass"`.
+ */
+function logDecision(log, I, base, kind, subject, classifier, result, via, { decided = null, why = null, probe = null, queue = null, cached = false, extra = {} } = {}) {
+  return log.log("decision", {
+    ...base,
+    ...I.decisionFields({
+      kind, subject, config: classifier, decided, why, probe, queue, cached,
+      // A cache hit carries no latency of its own — counting a reused verdict
+      // as a zero would pull every percentile down toward a number nothing
+      // ever measured. A RULES hit keeps its latency: sub-millisecond, and
+      // real work that really happened on this call.
+      result: cached ? { ...result, cascadeMs: null, latencyMs: null } : result,
+      extra,
+    }),
+    session: result.session ?? null,
+    streamed: Boolean(result.streamed),
+    via,
   })
 }
 
@@ -806,6 +916,19 @@ async function warm() {
   const I = LocalClassifier.internals
   const { hook: cfg, classifier } = resolveHookConfig(I, process.env)
   const started = Date.now()
+  // A hosted endpoint's key lives in the login shell, which launchd does not
+  // run, so this job may not have it while every real hook call does. Its
+  // absence says nothing about the model, and booking it as a failure would
+  // open the breaker on the calls that can classify. Skip, record nothing.
+  if (classifier.apiKeyEnv && !process.env[classifier.apiKeyEnv]) {
+    I.createLogger({ ...classifier, logDir: cfg.logDir }).log("warm", {
+      harness: "claude-code", hook_version: HOOK_VERSION,
+      endpoint: classifier.endpoint, model: classifier.model,
+      prompt_version: I.PROMPT_VERSION, skipped: "no_api_key",
+    })
+    process.stdout.write(`warm skipped: ${classifier.apiKeyEnv} is not set\n`)
+    process.exit(0)
+  }
   // The warm is not exempt from the flight list: during the very congestion
   // the probe exists for, it would otherwise queue a full prefill behind the
   // long request every four minutes and then book the timeout as a failure.
@@ -821,10 +944,12 @@ async function warm() {
     process.exit(0)
   }
   // The whole answer, so the warm covers the reason's tokens too.
-  const first = await I.classify({ kind: "bash", subject: "true", config: classifier, projectDir: null })
+  // `classifyStages`, not `classify`: a warm-up must reach the server, and
+  // `classify` answers `true` locally from the inert-reader rules.
+  const first = await I.classifyStages({ kind: "bash", subject: "true", config: classifier, projectDir: null })
   const result = I.withReason ? await I.withReason(first) : first
   const breaker = loadBreaker(cfg)
-  const next = breaker.record(Boolean(result.failure))
+  const next = recordOutcome(breaker, result)
   const log = I.createLogger({ ...classifier, logDir: cfg.logDir })
   if (result.failure && next.openedAt) {
     log.log("breaker.open", { harness: "claude-code", hook_version: HOOK_VERSION, source: "warm",
@@ -899,7 +1024,13 @@ async function worker() {
     say({ verdict: null, reason: null, raw: null, failure: "worker_bad_job" })
     return process.exit(0)
   }
-  const result = await I.classify({ kind: job.kind, subject: job.subject, config: classifier, projectDir: job.projectDir ?? null })
+  const result = await I.classify({
+    kind: job.kind, subject: job.subject, config: classifier,
+    projectDir: job.projectDir ?? null,
+    // The worker is where the model answer arrives, so the worker is what
+    // fills the cache the parent reads on the next call.
+    cache: loadVerdictCache(cfg, I),
+  })
   // RISKY waits for its reason: it is what the posture shows to the agent or
   // leaves in the built-in classifier's lap, and RISKY is the rare path.
   let latencyMs = result.latencyMs
@@ -919,21 +1050,34 @@ async function worker() {
     // have written, under the parent's join keys.
     const base = job.base ?? {}
     const rec = { ...result, latencyMs, streamed: Boolean(result.rest) }
-    const next = loadBreaker(cfg).record(Boolean(result.failure))
+    const next = recordOutcome(loadBreaker(cfg), result)
     if (result.failure && next.openedAt) {
       log.log("breaker.open", { ...base, after_consecutive_failures: next.consecutiveFailures, cooldown_ms: cooldownFor(cfg, next.opens) })
     }
-    logClassification(log, I, base, job.kind, job.subject, classifier, rec, "worker-detached")
+    // Nobody is acting on this, but the row still records what the gate WOULD
+    // have said — that is the whole content of shadow mode. Plan first, then
+    // one row carrying both the verdict and the intent.
     const plan = planFor(rec, { posture: base.posture ?? cfg.posture, breakerPolicy: cfg.breakerPolicy }, job.riskyPrefix)
     const speaks = plan.outcome === "allow" || plan.outcome === "deny"
-    log.log("action", { ...base, ...plan.extra, decided: speaks ? `would_${plan.outcome}` : plan.outcome, why: plan.why, detached: true })
-  }
-  if (result.rest) {
-    const tail = await result.rest
-    log.log("classification.tail", {
-      ...(job.base ?? {}), permission: job.kind,
-      verdict: result.verdict, reason: tail.reason, failure: tail.failure,
-      latency_ms: tail.latencyMs, contradicted: tail.contradicted, raw_output: I.truncated(tail.raw, 4000),
+    // A streamed SAFE decided before its reason arrived; wait for it here,
+    // where nothing is blocked on the answer, so the row carries the reason
+    // the model actually gave. Schema 1 logged this as a second
+    // `classification.tail` row with a `contradicted` flag — which compared
+    // the model's reason to its own verdict and was never a correctness
+    // signal, only a parser self-check.
+    if (result.rest) {
+      const tail = await result.rest
+      if (tail?.reason) rec.reason = tail.reason
+      if (tail?.failure && !rec.failure) rec.failure = tail.failure
+    }
+    logDecision(log, I, base, job.kind, job.subject, classifier, rec, "worker-detached", {
+      decided: speaks ? `would_${plan.outcome}` : plan.outcome,
+      why: plan.why,
+      // The parent ran the probe before handing the job over; the worker has
+      // no view of its own, so they travel on the job.
+      probe: job.probe ?? null,
+      queue: job.queue ?? null,
+      extra: { detached: true },
     })
   }
   process.exit(0)
@@ -1077,10 +1221,12 @@ async function main() {
       const root = claimAsk(cfg, input?.tool_use_id ?? null)
       if (root && acting) {
         const { added } = rememberRoot(cfg, root)
-        I.createLogger({ ...classifier, logDir: cfg.logDir }).log("action", {
+        // Not a gate decision — the call already ran. Its own event, so it
+        // cannot be mistaken for one when counting outcomes.
+        I.createLogger({ ...classifier, logDir: cfg.logDir }).log("root.remembered", {
           harness: "claude-code", hook_version: HOOK_VERSION,
           session_id: input?.session_id ?? null, tool_use_id: input?.tool_use_id ?? null,
-          tool, decided: "remembered", why: added ? `remembered ${root}` : `${root} already remembered`,
+          tool, why: added ? `remembered ${root}` : `${root} already remembered`,
           candidateRoot: root,
         })
       }
@@ -1106,13 +1252,36 @@ async function main() {
    * nothing (the built-in classifier decides), "uncovered" is pass for a tool
    * we never looked at. Shadow logs allow/deny as would_* and says nothing.
    */
+  /**
+   * Context from the classification this decision rests on, parked by run()
+   * so decide() can put the verdict and the intent on ONE row. Null for the
+   * paths that never asked a model — an uncovered tool, an over-long command,
+   * a write the path rules settle on their own.
+   */
+  let pending = null
   const decide = (outcome, why, extra = {}) => {
     const speaks = outcome === "allow" || outcome === "deny" || outcome === "ask"
-    log.log("action", {
-      ...base, ...extra,
-      decided: speaks && !acting ? `would_${outcome}` : outcome,
-      why,
-    })
+    const decided = speaks && !acting ? `would_${outcome}` : outcome
+    if (pending) {
+      const { kind, subject, result, via, probe, queue, cached } = pending
+      pending = null
+      logDecision(log, I, base, kind, subject, classifier, result, via, { decided, why, probe, queue, cached, extra })
+    } else {
+      // No model was asked. The row still has to exist and still has to carry
+      // a closed-set outcome, or the denominator goes ambiguous again.
+      log.log("decision", {
+        ...base,
+        permission: extra.permission ?? null,
+        subject: extra.subject ?? null,
+        subject_sha: extra.subject === undefined || extra.subject === null ? null : I.subjectSha(extra.subject),
+        outcome: outcome === "uncovered" ? "uncovered" : "unjudged",
+        unjudged_why: extra.failure ?? (outcome === "uncovered" ? null : "not_classified"),
+        decided, why,
+        stage: null, rule: null, reason: null,
+        ms: null, attempts: [],
+        ...extra,
+      })
+    }
     if (outcome === "deny" && acting) return deny(why)
     if (outcome === "allow" && acting) return approve("allow", why)
     // "ask" hands the decision to the human. The candidate root is parked
@@ -1128,6 +1297,7 @@ async function main() {
   late = decide
 
   const breaker = loadBreaker(cfg)
+  const verdictCache = loadVerdictCache(cfg, I)
   const inProcess = process.env.CC_CLASSIFIER_INPROCESS === "1"
   // Detached only when nobody acts on the answer: shadow, worker path.
   const detached = !acting && cfg.shadowDetached && !inProcess
@@ -1141,26 +1311,53 @@ async function main() {
    * and leave the log rows to the worker.
    */
   const run = async (kind, subject, riskyPrefix) => {
-    if (breaker.open) {
-      log.log("classification", {
-        ...base, permission: kind, subject,
-        skipped: "breaker_open", breaker: breaker.state,
-      })
-      return { verdict: null, failure: "breaker_open" }
+    // Everything decidable without the model, on the parent's own critical
+    // path: the RISKY rules, the inert-reader SAFE rules, then the verdict
+    // cache. A hit here costs no worker process, no HTTP request and no queue
+    // slot, and settles 24.6% + ~5% of real bash traffic in under a
+    // millisecond.
+    //
+    // BEFORE the breaker on purpose. These answers do not need the model, so
+    // whether the model is reachable is not a question that applies to them —
+    // which means a quarter of commands keep getting real verdicts through an
+    // outage instead of degrading to the built-in classifier.
+    const early = I.preflight({ kind, subject, config: classifier, projectDir, cache: verdictCache })
+    if (early) {
+      pending = { kind, subject, result: early, via: early.cached ? "cache" : "rules",
+                  probe: null, queue: null, cached: Boolean(early.cached) }
+      return early
     }
-    const { busy, probe } = await probeBusy(classifier, cfg)
+
+    if (breaker.open) {
+      pending = { kind, subject, result: { verdict: null, failure: "breaker_open" }, via: "not-attempted",
+                  probe: null, queue: null }
+      return { verdict: null, failure: "breaker_open", breakerState: breaker.state }
+    }
+    const { busy, probe, inFlight } = await probeBusy(classifier, cfg)
+    // The flight list is the only view a fresh hook process has of what the
+    // model is already doing — a hook holds no in-process queue, so `depth`
+    // and `waitMs` stay null here and are the plugin's fields alone.
+    //
+    // WHOSE flight list: the probe targets the SECONDARY's mtplx server, not
+    // the primary (see probeBusy). So `in_flight` is the secondary's load.
+    // Do not read it as the primary's — the primary is a single-tenant
+    // mlx_lm.server that publishes nothing.
+    const queue = { depth: null, waitMs: null, inFlight: inFlight ?? null }
     if (busy) {
-      log.log("classification", { ...base, permission: kind, subject, skipped: "busy", busy, probe })
+      pending = { kind, subject, result: { verdict: null, failure: "busy" }, via: "not-attempted", probe, queue }
       return { verdict: null, failure: "busy", busy }
     }
     if (detached) {
-      const { failure } = await spawnWorker({ kind, subject, projectDir, base, detached: true, riskyPrefix }, { wantStdout: false })
+      const { failure } = await spawnWorker({ kind, subject, projectDir, base, detached: true, riskyPrefix, probe, queue }, { wantStdout: false })
       if (!failure) {
         // One parent-side row per dispatched call, so a worker that dies
         // before it can log (a broken import, an OOM kill, its own exit
-        // timer) leaves a hole an analyzer can count — dispatched minus
-        // classified — instead of a call that never happened.
-        log.log("classification.dispatched", { ...base, permission: kind, subject, probe })
+        // timer) leaves a hole an analyzer can count — dispatch minus
+        // decision — instead of a call that never happened. Join keys and a
+        // digest only: the subject and the probe travel on the decision row
+        // the worker writes, and duplicating them here bought nothing but
+        // bytes.
+        log.log("dispatch", { ...base, permission: kind, subject_sha: I.subjectSha(subject) })
         return { verdict: null, failure: null, deferred: true }
       }
       // The worker never started, so nothing will log this call: fall through
@@ -1170,17 +1367,17 @@ async function main() {
       if (next.openedAt) {
         log.log("breaker.open", { ...base, after_consecutive_failures: next.consecutiveFailures, cooldown_ms: cooldownFor(cfg, next.opens) })
       }
-      logClassification(log, I, base, kind, subject, classifier, result, "worker-detached", probe)
+      pending = { kind, subject, result, via: "worker-failed-to-start", probe, queue }
       return result
     }
     const result = inProcess
-      ? await I.withReason(await I.classify({ kind, subject, config: classifier, projectDir }))
+      ? await I.withReason(await I.classify({ kind, subject, config: classifier, projectDir, cache: verdictCache }))
       : await classifyViaWorker({ kind, subject, projectDir, base, classifier })
-    const next = breaker.record(Boolean(result.failure))
+    const next = recordOutcome(breaker, result)
     if (result.failure && next.openedAt) {
       log.log("breaker.open", { ...base, after_consecutive_failures: next.consecutiveFailures, cooldown_ms: cooldownFor(cfg, next.opens) })
     }
-    logClassification(log, I, base, kind, subject, classifier, result, inProcess ? "in-process" : "worker", probe)
+    pending = { kind, subject, result, via: inProcess ? "in-process" : "worker", probe, queue }
     return result
   }
 
@@ -1271,7 +1468,7 @@ export const hookInternals = Object.freeze({
   HOOK_DEFAULTS, POSTURES, HOOK_VERSION,
   peekMode, resolveHookConfig, ccOwnRoot, normalizeExtraRoots,
   candidateRootFor, loadRememberedRoots, rememberRoot, parkAsk, claimAsk,
-  loadBreaker, cooldownFor, probeBusy, planFor,
+  loadBreaker, recordOutcome, cooldownFor, probeBusy, planFor, loadVerdictCache,
 })
 
 function isEntrypoint() {

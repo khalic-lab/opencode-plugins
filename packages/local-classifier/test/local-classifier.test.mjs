@@ -371,29 +371,29 @@ describe("classify — every failure path returns verdict null", () => {
   const ok = (content) => async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content } }] }) })
 
   test("happy path SAFE", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: ok("VERDICT: SAFE\nREASON: read-only") })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: ok("VERDICT: SAFE\nREASON: read-only") })
     expect(r.verdict).toBe("SAFE")
     expect(r.failure).toBeNull()
     expect(r.raw).toContain("VERDICT")
   })
   test("http error", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: async () => ({ ok: false, status: 503 }) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: async () => ({ ok: false, status: 503 }) })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("http_503")
   })
   test("malformed output", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: ok("I think this is fine!") })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: ok("I think this is fine!") })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("malformed_output")
   })
   test("empty output", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: ok(null) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: ok(null) })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("empty_output")
   })
   test("fetch rejection", async () => {
     const r = await classify({
-      kind: "bash", subject: "ls", config,
+      kind: "bash", subject: "git status", config,
       fetchImpl: async () => { throw new Error("ECONNREFUSED") },
     })
     expect(r.verdict).toBeNull()
@@ -402,7 +402,7 @@ describe("classify — every failure path returns verdict null", () => {
   test("timeout aborts and fails closed", async () => {
     const shortConfig = { ...config, timeoutMs: 30 }
     const r = await classify({
-      kind: "bash", subject: "ls", config: shortConfig,
+      kind: "bash", subject: "git status", config: shortConfig,
       fetchImpl: (_url, { signal }) =>
         new Promise((_, reject) => {
           signal.addEventListener("abort", () => {
@@ -416,7 +416,7 @@ describe("classify — every failure path returns verdict null", () => {
   test("well-formed verdict arriving after the deadline is discarded", async () => {
     let t = 0
     const r = await classify({
-      kind: "bash", subject: "ls", config,
+      kind: "bash", subject: "git status", config,
       now: () => { const v = t; t += 600; return v }, // started=0, deadline=1000; post-fetch now=1200
       fetchImpl: ok("VERDICT: SAFE\nREASON: late"),
     })
@@ -484,7 +484,7 @@ describe("project_dir injection (p6)", () => {
     }
     const config = { ...resolveConfig({ readFile: () => null, env: {} }).config, timeoutMs: 1000 }
     for (const dir of ["/usr/local/src/webapp-142", "/Users/dev/other"]) {
-      await classify({ kind: "bash", subject: "ls", config, projectDir: dir, fetchImpl })
+      await classify({ kind: "bash", subject: "git status", config, projectDir: dir, fetchImpl })
     }
     expect(bodies[0].messages[0].content).toBe(bodies[1].messages[0].content)
     expect(bodies[0].messages[1].content).not.toBe(bodies[1].messages[1].content)
@@ -515,7 +515,7 @@ describe("project_dir injection (p6)", () => {
       return { ok: true, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: ok" } }] }) }
     }
     const config = { ...resolveConfig({ readFile: () => null, env: {} }).config, timeoutMs: 1000 }
-    await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    await classify({ kind: "bash", subject: "git status", config, fetchImpl })
     await classify({ kind: "external_directory", subject: "/tmp/x", config, fetchImpl })
     expect(seen).toHaveLength(2)
     for (const body of seen) expect(body.chat_template_kwargs).toEqual({ enable_thinking: false })
@@ -592,7 +592,7 @@ describe("classify — streamed, settled on the first line", () => {
 
   test("the verdict is handed out before the reason arrives, and the reason follows", async () => {
     const t0 = Date.now()
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"], [150, "REASON: read-only"], [0, null]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"], [150, "REASON: read-only"], [0, null]]) })
     expect(r.verdict).toBe("SAFE")
     expect(r.failure).toBeNull()
     expect(Date.now() - t0).toBeLessThan(120)
@@ -607,14 +607,14 @@ describe("classify — streamed, settled on the first line", () => {
     expect(r.raw).toBe("VERDICT: SAFE\nREASON: read-only")
   })
   test("withReason merges the tail", async () => {
-    const r = await withReason(await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: RISKY\n"], [20, "REASON: deletes"], [0, null]]) }))
+    const r = await withReason(await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "VERDICT: RISKY\n"], [20, "REASON: deletes"], [0, null]]) }))
     expect(r.verdict).toBe("RISKY")
     expect(r.reason).toBe("deletes")
     expect(r.fullLatencyMs).toBeGreaterThanOrEqual(r.latencyMs)
     expect(r.contradicted).toBe(false)
   })
   test("a late reversal is reported, not obeyed", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\nREASON: fine\n"], [10, "Actually this is RISKY"], [0, null]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "VERDICT: SAFE\nREASON: fine\n"], [10, "Actually this is RISKY"], [0, null]]) })
     expect(r.verdict).toBe("SAFE")
     const tail = await r.rest
     expect(tail.contradicted).toBe(true)
@@ -622,25 +622,25 @@ describe("classify — streamed, settled on the first line", () => {
     expect(tail.failure).toBeNull()
   })
   test("no verdict on the first line fails closed with the whole text", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "I think this is fine\n"], [10, "VERDICT: SAFE"], [0, null]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "I think this is fine\n"], [10, "VERDICT: SAFE"], [0, null]]) })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("malformed_output")
     expect(r.raw).toBe("I think this is fine\nVERDICT: SAFE")
     expect(r.rest).toBeNull()
   })
   test("a verdict-only answer settles whole", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: RISKY"], [0, null]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "VERDICT: RISKY"], [0, null]]) })
     expect(r.verdict).toBe("RISKY")
     expect(r.reason).toBe("")
     expect(r.rest).toBeNull()
   })
   test("an empty stream is empty_output", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, null]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, null]]) })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("empty_output")
   })
   test("a tail that never ends is abandoned on its own clock; the verdict stands", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"]], { hang: true }) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"]], { hang: true }) })
     expect(r.verdict).toBe("SAFE")
     const tail = await r.rest
     expect(tail.failure).toBe("tail_timeout")
@@ -649,13 +649,13 @@ describe("classify — streamed, settled on the first line", () => {
     expect(r.reason).toBe("")
   })
   test("a stream error after the verdict is a tail failure, not a lost decision", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"], [10, undefined]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl: sse([[0, "VERDICT: SAFE\n"], [10, undefined]]) })
     expect(r.verdict).toBe("SAFE")
     const tail = await r.rest
     expect(tail.failure).toMatch(/^tail_error:/)
   })
   test("nothing before the deadline is a timeout", async () => {
-    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, timeoutMs: 40 }, fetchImpl: sse([[500, "VERDICT: SAFE\n"], [0, null]]) })
+    const r = await classify({ kind: "bash", subject: "git status", config: { ...config, timeoutMs: 40 }, fetchImpl: sse([[500, "VERDICT: SAFE\n"], [0, null]]) })
     expect(r.verdict).toBeNull()
     expect(r.failure).toBe("timeout")
   })
@@ -665,8 +665,8 @@ describe("classify — streamed, settled on the first line", () => {
       seen.push(JSON.parse(init.body).stream)
       return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content } }] }) }
     }
-    const a = await classify({ kind: "bash", subject: "ls", config, fetchImpl: capture("VERDICT: SAFE\nREASON: x") })
-    const b = await classify({ kind: "bash", subject: "ls", config: { ...config, stream: false }, fetchImpl: capture("VERDICT: SAFE\nREASON: x") })
+    const a = await classify({ kind: "bash", subject: "git status", config, fetchImpl: capture("VERDICT: SAFE\nREASON: x") })
+    const b = await classify({ kind: "bash", subject: "git status", config: { ...config, stream: false }, fetchImpl: capture("VERDICT: SAFE\nREASON: x") })
     expect(seen).toEqual([true, false])
     // A JSON answer to a streaming request is still read whole.
     expect(a.verdict).toBe("SAFE"); expect(a.reason).toBe("x"); expect(a.rest).toBeNull()
@@ -676,13 +676,13 @@ describe("classify — streamed, settled on the first line", () => {
     const seen = []
     const answer = { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: x" } }] }) }
     const capture = async (_url, init) => { seen.push(init.headers["x-mtplx-session-id"] ?? null); return answer }
-    for (let i = 0; i < 4; i++) await classify({ kind: "bash", subject: "ls", config, fetchImpl: capture })
+    for (let i = 0; i < 4; i++) await classify({ kind: "bash", subject: "git status", config, fetchImpl: capture })
     await classify({ kind: "external_directory", subject: "/x", config, fetchImpl: capture })
     expect(seen.slice(0, 4).every((id) => /^local-classifier-bash-[01]$/.test(id))).toBe(true)
     expect(seen[0]).not.toBe(seen[1])
     expect(seen[0]).toBe(seen[2])
     expect(seen[4]).toMatch(/^local-classifier-external_directory-[01]$/)
-    await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl: capture })
+    await classify({ kind: "bash", subject: "git status", config: { ...config, sessionPool: 0 }, fetchImpl: capture })
     expect(seen[5]).toBeNull()
   })
   test("a 409 on the named session retries once without it and still decides", async () => {
@@ -693,7 +693,7 @@ describe("classify — streamed, settled on the first line", () => {
       if (id) return { ok: false, status: 409 }
       return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: x" } }] }) }
     }
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl })
     // Ladder: this call's own id, then the pool's other id, then anonymous.
     expect(calls.length).toBe(3)
     expect(calls[0]).toMatch(/^local-classifier-bash-/)
@@ -705,7 +705,7 @@ describe("classify — streamed, settled on the first line", () => {
   })
   test("a 409 with no session id is an ordinary http failure, not retried", async () => {
     let n = 0
-    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl: async () => { n++; return { ok: false, status: 409 } } })
+    const r = await classify({ kind: "bash", subject: "git status", config: { ...config, sessionPool: 0 }, fetchImpl: async () => { n++; return { ok: false, status: 409 } } })
     expect(n).toBe(1)
     expect(r.failure).toBe("http_409")
     expect(r.session).toEqual({ id: null, used: null, fallback: false })
@@ -724,7 +724,7 @@ describe("classify — streamed, settled on the first line", () => {
       if (calls.length < 3) return sse([[0, null]])(url, init)
       return sse([[0, "VERDICT: SAFE\nREASON: x"], [0, null]])(url, init)
     }
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl })
     expect(calls.length).toBe(3)
     expect(calls[0]).toMatch(/^local-classifier-bash-/)
     expect(calls[1]).not.toBe(calls[0])
@@ -743,7 +743,7 @@ describe("classify — streamed, settled on the first line", () => {
       calls.push(init.headers["x-mtplx-session-id"] ?? null)
       return sse([[0, null]])(url, init)
     }
-    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 3 }, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: { ...config, sessionPool: 3 }, fetchImpl })
     expect(calls.length).toBe(4)
     expect(calls[3]).toBeNull()
     const named = calls.slice(0, 3)
@@ -755,7 +755,7 @@ describe("classify — streamed, settled on the first line", () => {
   test("an empty answer on the LAST rung is reported, not retried forever", async () => {
     let n = 0
     const fetchImpl = async (url, init) => { n++; return sse([[0, null]])(url, init) }
-    const r = await classify({ kind: "bash", subject: "ls", config, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config, fetchImpl })
     expect(n).toBe(3)
     expect(r.failure).toBe("empty_output")
     expect(r.verdict).toBeNull()
@@ -764,7 +764,7 @@ describe("classify — streamed, settled on the first line", () => {
   test("a pool of 0 sends no header and never retries an empty answer", async () => {
     let n = 0
     const fetchImpl = async (url, init) => { n++; return sse([[0, null]])(url, init) }
-    const r = await classify({ kind: "bash", subject: "ls", config: { ...config, sessionPool: 0 }, fetchImpl })
+    const r = await classify({ kind: "bash", subject: "git status", config: { ...config, sessionPool: 0 }, fetchImpl })
     expect(n).toBe(1)
     expect(r.failure).toBe("empty_output")
   })
@@ -775,5 +775,132 @@ describe("classify — streamed, settled on the first line", () => {
     expect(parseVerdictLine("VERDICT: SAFE because")).toBeNull()
     expect(parseVerdictLine("REASON: x")).toBeNull()
     expect(parseVerdictLine(null)).toBeNull()
+  })
+})
+
+describe("apiKeyEnv — a bearer token for `endpoint` only, read from the environment", () => {
+  const VAR = "LC_TEST_API_KEY"
+  const answer = { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: SAFE\nREASON: x" } }] }) }
+  const base = { endpoint: "http://hosted/v1", model: "m", timeoutMs: 1000, maxTokens: 160, temperature: 0, stream: false, sessionPool: 0 }
+  // What resolveConfig produces for `apiKeyEnv: VAR` on this endpoint; see authHeaders.
+  const keyed = { ...base, apiKeyEnv: VAR, apiKeyEndpoint: base.endpoint }
+  const withKey = async (value, fn) => {
+    const before = process.env[VAR]
+    if (value === undefined) delete process.env[VAR]; else process.env[VAR] = value
+    try { return await fn() } finally { if (before === undefined) delete process.env[VAR]; else process.env[VAR] = before }
+  }
+
+  test("resolveConfig takes it from the user file, reports an unset variable, rejects a bad name", () => {
+    const user = (v) => (f) => (f.includes(".config/opencode/") ? { apiKeyEnv: v } : null)
+    const set = resolveConfig({ readFile: user(VAR), env: { [VAR]: "k" } })
+    expect(set.config.apiKeyEnv).toBe(VAR)
+    expect(set.config.apiKeyEndpoint).toBe(set.config.endpoint)
+    expect(resolveConfig({ readFile: () => null, env: {} }).config.apiKeyEndpoint).toBeNull()
+    expect(set.problems).toEqual([])
+    const unset = resolveConfig({ readFile: user(VAR), env: {} })
+    expect(unset.config.apiKeyEnv).toBe(VAR)
+    expect(unset.problems).toEqual([`apiKeyEnv ${VAR} is not set in this process; calls will fail as no_api_key`])
+    const bad = resolveConfig({ readFile: user("A-B"), env: {} })
+    expect(bad.config.apiKeyEnv).toBeNull()
+    expect(bad.problems).toEqual(["invalid apiKeyEnv"])
+  })
+  test("a project file may not set it", () => {
+    const readFile = (f) => (f.includes(".opencode/") ? { apiKeyEnv: "HOME" } : null)
+    const { config, problems } = resolveConfig({ worktree: "/w", readFile, env: {} })
+    expect(config.apiKeyEnv).toBeNull()
+    expect(problems).toEqual(["project-file may not set apiKeyEnv; ignored"])
+  })
+  test("untrusted plugin options may not set it, and no layer may set the endpoint it is bound to", () => {
+    const opt = resolveConfig({ options: { apiKeyEnv: "HOME" }, readFile: () => null, env: {} })
+    expect(opt.config.apiKeyEnv).toBeNull()
+    expect(opt.problems).toEqual(["options may not set apiKeyEnv; ignored"])
+    const stamp = resolveConfig({ readFile: () => ({ apiKeyEndpoint: "http://evil/v1" }), env: {} })
+    expect(stamp.config.apiKeyEndpoint).toBeNull()
+    expect(stamp.problems).toEqual(["unknown key apiKeyEndpoint"])
+  })
+  test("an endpoint swapped in after resolveConfig does not inherit the key", async () => {
+    const seen = []
+    const fetchImpl = async (url, init) => { seen.push([url, init.headers.authorization ?? null]); return answer }
+    // What eval/smoke.mjs and eval/hardcases.mjs do with --endpoint.
+    await withKey("secret-3", () => classify({ kind: "bash", subject: "git status", config: { ...keyed, endpoint: "http://other/v1" }, fetchImpl }))
+    expect(seen).toEqual([["http://other/v1/chat/completions", null]])
+  })
+  test("a token with a control or non-ASCII character is refused unsent", async () => {
+    let calls = 0
+    const r = await withKey("abc\ndef", () =>
+      classify({ kind: "bash", subject: "git status", config: keyed, fetchImpl: async () => { calls++; return answer } }))
+    expect(calls).toBe(0)
+    expect(r.failure).toBe("bad_api_key")
+  })
+  test("cascade.secondary.apiKeyEnv: the key goes to the secondary only, bound to its resolved endpoint", async () => {
+    const user = (f) => (f.includes(".config/opencode/") ? {
+      endpoint: "http://box/v1", model: "p",
+      cascade: { secondary: { endpoint: "http://hosted/v1", model: "s", apiKeyEnv: VAR } },
+    } : null)
+    const unset = resolveConfig({ readFile: user, env: {} })
+    expect(unset.problems).toEqual([`cascade.secondary.apiKeyEnv ${VAR} is not set in this process; secondary calls will fail as no_api_key`])
+    const { config, problems } = resolveConfig({ readFile: user, env: { [VAR]: "k" } })
+    expect(problems).toEqual([])
+    expect(config.cascade.secondary).toEqual({ endpoint: "http://hosted/v1", model: "s", apiKeyEnv: VAR, apiKeyEndpoint: "http://hosted/v1" })
+    expect(resolveConfig({ readFile: (f) => (f.includes(".config/opencode/") ? { cascade: { secondary: { endpoint: "http://h/v1", model: "s", apiKeyEnv: "A-B" } } } : null), env: {} }).problems)
+      .toEqual(["invalid cascade.secondary.apiKeyEnv"])
+    const seen = {}
+    const fetchImpl = async (url, init) => {
+      seen[url] = init.headers.authorization ?? null
+      return url.startsWith("http://box")
+        ? { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: RISKY\nREASON: x" } }] }) }
+        : answer
+    }
+    const run = { ...config, timeoutMs: 1000, stream: false }
+    const r = await withKey("secret-5", () => classify({ kind: "bash", subject: "git status", config: run, fetchImpl }))
+    expect(r.stage).toBe("secondary")
+    expect(seen).toEqual({ "http://box/v1/chat/completions": null, "http://hosted/v1/chat/completions": "Bearer secret-5" })
+    // A secondary swapped in after resolveConfig does not inherit the key.
+    const swapped = { ...run, cascade: { ...run.cascade, secondary: { ...run.cascade.secondary, endpoint: "http://other/v1" } } }
+    for (const k of Object.keys(seen)) delete seen[k]
+    await withKey("secret-5", () => classify({ kind: "bash", subject: "git status", config: swapped, fetchImpl }))
+    expect(seen["http://other/v1/chat/completions"]).toBeNull()
+  })
+  test("a fallback address never sees the token", async () => {
+    const seen = {}
+    const fetchImpl = async (url, init) => {
+      seen[url] = init.headers.authorization ?? null
+      // The keyed endpoint is unreachable, so the primary moves to its fallback.
+      if (url.startsWith("http://hosted")) throw new Error("ECONNREFUSED")
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: RISKY\nREASON: x" } }] }) }
+    }
+    const config = { ...keyed, endpointFallbacks: [{ endpoint: "http://lan/v1", model: "m" }], cascade: { certain: 0.999, primaryTimeoutMs: 500 } }
+    await withKey("secret-4", () => classify({ kind: "bash", subject: "git status", config, fetchImpl }))
+    expect(seen).toEqual({ "http://hosted/v1/chat/completions": "Bearer secret-4", "http://lan/v1/chat/completions": null })
+  })
+  test("sends Authorization to `endpoint`, and none when unconfigured", async () => {
+    const seen = []
+    const fetchImpl = async (url, init) => { seen.push([url, init.headers.authorization ?? null]); return answer }
+    await withKey("secret-1", async () => {
+      const r = await classify({ kind: "bash", subject: "git status", config: keyed, fetchImpl })
+      expect(r.verdict).toBe("SAFE")
+      await classify({ kind: "bash", subject: "git status", config: base, fetchImpl })
+    })
+    expect(seen).toEqual([["http://hosted/v1/chat/completions", "Bearer secret-1"], ["http://hosted/v1/chat/completions", null]])
+  })
+  test("an unset variable fails as no_api_key without sending anything", async () => {
+    let calls = 0
+    const r = await withKey(undefined, () =>
+      classify({ kind: "bash", subject: "git status", config: keyed, fetchImpl: async () => { calls++; return answer } }))
+    expect(calls).toBe(0)
+    expect(r.verdict).toBeNull()
+    expect(r.failure).toBe("no_api_key")
+  })
+  test("a cascade secondary on another host never sees the token", async () => {
+    const seen = {}
+    const fetchImpl = async (url, init) => {
+      seen[url] = init.headers.authorization ?? null
+      // The primary is never certain, so the secondary is always asked.
+      return url.startsWith("http://hosted") ? { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "VERDICT: RISKY\nREASON: x" } }] }) } : answer
+    }
+    const config = { ...keyed, cascade: { certain: 0.999, primaryTimeoutMs: 500, secondary: { endpoint: "http://local/v1", model: "s" } } }
+    const r = await withKey("secret-2", () => classify({ kind: "bash", subject: "git status", config, fetchImpl }))
+    expect(r.stage).toBe("secondary")
+    expect(seen).toEqual({ "http://hosted/v1/chat/completions": "Bearer secret-2", "http://local/v1/chat/completions": null })
   })
 })

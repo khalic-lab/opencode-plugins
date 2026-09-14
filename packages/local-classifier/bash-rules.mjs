@@ -1319,6 +1319,203 @@ const RULES = [
 /** Longest command this layer looks at; past it, the model (or the human) decides. */
 const MAX_COMMAND_CHARS = 20_000
 
+// ---------------------------------------------------------------------------
+// The inert-reader layer — the ONE place in this module that asserts SAFE
+// ---------------------------------------------------------------------------
+
+/**
+ * Commands that read and print, and have no mode that writes, deletes, spawns
+ * a program named by their arguments, or opens a socket. That is the whole
+ * membership test, and it is why the set is short and closed rather than
+ * generous: this layer is the only thing in this file that can produce a MISS
+ * rather than merely friction, so a verb earns a place here by having no
+ * dangerous mode AT ALL, not by usually being harmless.
+ *
+ * Deliberately ABSENT, each for a specific mode:
+ *   tee            writes its operands
+ *   sort           `-o FILE` writes
+ *   jq / yq        `-i` edits in place
+ *   find           `-delete`, `-exec`
+ *   date           `-s` sets the system clock
+ *   sed / awk      `-i`, `w`, `system()`
+ *   env / xargs    run the program named in their arguments — and both are
+ *                  WRAPPERS to `canonicalize`, stripped before a verb is read,
+ *                  so `env -i … /bin/zsh script.sh` arrives here as `zsh`
+ *
+ * `tail -f` never returns, which would matter if anything here executed. It
+ * does not: this layer reads command TEXT and never runs it.
+ */
+const INERT_VERBS = new Set([
+  "cat", "head", "tail", "wc", "nl", "column",
+  "grep", "egrep", "fgrep", "rg",
+  "cut", "tr", "uniq",
+  "ls", "pwd", "basename", "dirname",
+  "echo", "printf", "true", "false", "sleep",
+  "ps", "whoami", "id", "hostname", "uname", "which", "type",
+])
+
+/**
+ * `>/dev/null` is the one redirect that discards rather than writes, and
+ * `nvm use 22 >/dev/null` alone is 253 commands in the shadow corpus. Every
+ * other target — a bare `>` onto a path, `/dev/stdout`, a fifo — takes the
+ * command out of this layer. (`2>&1` never reaches here: `parseSegments`
+ * records a file descriptor as a word, not a redirect.)
+ */
+const DISCARD_TARGETS = new Set(["/dev/null"])
+
+/**
+ * Per-application private state: browser profiles, token stores, session
+ * databases, cookie jars. "Reads only" is a claim about the VERB; it is a
+ * claim about the command only when what is being read is ordinary, and these
+ * trees are where an application keeps the things it would never print.
+ *
+ * Found by measurement, not by imagination. Over the shadow corpus this layer
+ * called three commands SAFE that the model called RISKY, and all three were
+ * the same command:
+ *
+ *   cd ~/Library/Application\ Support && rg -l -a --hidden --no-ignore -i \
+ *      -f pat.txt superwhisper com.raycast.macos Antigravity Notion Claude ...
+ *
+ * Every verb in it is a reader and the model was still right: that is a
+ * credential sweep over every app's data directory. R1 credential-kinds does
+ * not fire because no operand is a credential FILE — the whole point of the
+ * command is that it does not know the filenames yet.
+ *
+ * Checked against the cwd as well as the operands, because `cd` into the tree
+ * and read a relative path is the same command.
+ */
+const PRIVATE_DATA_ROOTS = Object.freeze([
+  "~/Library/Application Support",
+  "~/Library/Containers",
+  "~/Library/Group Containers",
+  "~/Library/Cookies",
+  "~/Library/Keychains",
+  "~/Library/Safari",
+  "~/Library/Messages",
+  "~/.local/share/keyrings",
+  "~/.mozilla",
+  "~/.config/google-chrome",
+  "~/.config/chromium",
+])
+
+/**
+ * A deterministic SAFE for commands that only read.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Over the 2026-09-02..09 shadow window the classifier judged 7,121 commands
+ * and 6,674 of them were distinct — agent-authored command text almost never
+ * repeats, so no verdict cache can cover more than ~6% of the traffic. The
+ * load has to come off somewhere else, and the shape of the traffic says
+ * where: the top of it is `grep`, `head`, `cat`, `ls`, `wc`, `ps` — reads,
+ * sent to a 4B model over the network, one at a time, through a serial queue
+ * that this classifier saturates by itself.
+ *
+ * CONTRACT
+ * --------
+ *   inertBashCommand(command, { projectDir, fs })
+ *     → null                                   (no opinion — hand to the model)
+ *     → { verdict: "SAFE", rule, why }         (assert no ask is needed)
+ *
+ * This is the inverse of `judgeBashCommand` and carries the inverse risk: that
+ * function can only ADD asks, so its worst failure is friction, while this one
+ * REMOVES an ask, so its worst failure is a miss. Everything below is
+ * therefore written to decline. It returns SAFE only when every segment of the
+ * command resolves to a concrete verb in a closed set, and declines outright
+ * on anything it cannot resolve: an unexpanded `$VAR` or a glob in ANY
+ * position, a command substitution, a heredoc, a redirect that is not a
+ * discard, `sudo`, `xargs`, or a parser exception.
+ *
+ * ORDER MATTERS. The caller runs `judgeBashCommand` FIRST and only reaches
+ * this on a null. The RISKY rules therefore always win, which is what lets the
+ * verb set stay a pure read-test: `cat` is in it, and `cat ~/.ssh/id_rsa` is
+ * still an ask, because R1 credential-kinds fired before this ran.
+ */
+export function inertBashCommand(command, opts = {}) {
+  if (typeof command !== "string" || command.trim() === "") return null
+  if (command.length > MAX_COMMAND_CHARS) return null
+  const ctx = makeContext(opts)
+  try {
+    return inertAll(command, ctx)
+  } catch {
+    // Same policy as judgeBashCommand and the same direction: a parser bug
+    // must never become a verdict. Here declining costs one model call.
+    return null
+  }
+}
+
+/** Is this absolute path inside a per-application private-state tree? */
+function inPrivateData(abs, ctx) {
+  if (!abs) return false
+  const norm = normalizeTmp(abs)
+  return PRIVATE_DATA_ROOTS.some((r) => under(norm, normalizeTmp(resolveHome(r, ctx.home))))
+}
+
+function inertAll(command, ctx) {
+  // A heredoc body is text this layer never inspected. `stripHeredocs` removes
+  // it precisely so the newline splitter does not read script lines as
+  // commands — right for the RISKY rules, and not something to assert SAFE
+  // over. If anything was stripped, there was a heredoc: decline.
+  const text = stripHeredocs(command)
+  if (text !== command) return null
+
+  const segs = parseSegments(text)
+  if (!segs.length) return null
+
+  const state = { cwd: ctx.projectDir, vars: new Map(), lastForGlob: null }
+  const verbs = []
+
+  for (const seg of segs) {
+    // A substitution runs a command of its own. `judgeBashCommand` recurses
+    // into these; this layer declines, because "every branch of this is inert"
+    // is a stronger claim than the one it is worth making here.
+    if (seg.subs.length) return null
+
+    for (const r of seg.redirects) {
+      if (r.op !== ">" && r.op !== ">>") return null
+      if (!r.target.concrete || !DISCARD_TARGETS.has(r.target.v)) return null
+    }
+
+    const words = expand(seg.words, state)
+    // Every word, not just the verb. An unresolved operand is harmless only if
+    // you already know the verb ignores it, and that is a per-verb argument
+    // this layer does not make: `cat $F` is inert whatever `$F` holds, but the
+    // rule that admits it is one character away from admitting `sh $F`.
+    if (!words.every((w) => w.concrete)) return null
+
+    const cmd = canonicalize(words, state)
+    if (!cmd.verb) return null
+    // `canonicalize` reports these rather than leaving them in the verb, so
+    // `sudo cat x` arrives here as a plain `cat`.
+    if (cmd.sudo || cmd.xargs) return null
+
+    if (cmd.verb === "cd" || cmd.verb === "pushd") {
+      const target = operands(cmd.args)[0]
+      state.cwd = target ? resolveWord(target, state, ctx) : ctx.home
+      continue
+    }
+
+    if (!INERT_VERBS.has(cmd.verb)) return null
+    // Where it reads, not just how. `state.cwd` covers `cd` into the tree and
+    // then a relative operand; the operands cover naming it outright. A
+    // non-path operand (grep's pattern) simply resolves to nothing under
+    // these roots, so it costs a comparison and no accuracy.
+    if (inPrivateData(state.cwd, ctx)) return null
+    for (const o of operands(cmd.args)) {
+      if (inPrivateData(resolveWord(o, state, ctx), ctx)) return null
+    }
+    verbs.push(cmd.verb)
+  }
+
+  // A command that is nothing but `cd` moved the shell and read nothing. It is
+  // harmless, but it is also not what this layer was measured on, and an empty
+  // verb list would mean a parse that found no commands at all reads as SAFE.
+  if (!verbs.length) return null
+
+  const shown = [...new Set(verbs)].slice(0, 4).join(", ")
+  return { verdict: "SAFE", rule: "inert-readers", why: `reads only (${shown})` }
+}
+
 /**
  * @param {string} command                the exact string handed to the shell
  * @param {object} [opts]
@@ -1418,7 +1615,7 @@ function judgeNested(text, ctx, parentState, depth) {
 
 /** Internals, exported for the tests only. */
 export const internals = {
-  parseSegments, stripHeredocs, canonicalize, credentialKind,
+  parseSegments, stripHeredocs, canonicalize, credentialKind, INERT_VERBS,
   isScratch, isWorkingArea, isExecArea, isSensitiveWriteTarget,
   SENSITIVE_WRITE_PATTERNS,
 }

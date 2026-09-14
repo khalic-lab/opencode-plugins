@@ -38,6 +38,36 @@ import os from "node:os"
 import path from "node:path"
 
 const MACHINE_REPLY_MS = 500
+
+/** `unjudged_why` values that mean the model was never asked, not that it failed. */
+const SKIP_REASONS = new Set(["breaker_open", "busy", "too_long", "not_classified"])
+
+/**
+ * Schema 2 replaced `classification` + `action` with one `decision` row, and
+ * the nullable `verdict`/`failure`/`skipped` trio with a closed-set `outcome`
+ * plus `unjudged_why`. Everything downstream of here was written against
+ * schema 1 and reads those old names, so translate once at ingest rather than
+ * branching in forty places. The new fields (`attempts`, `queue_depth`,
+ * `subject_sha`, `outcome`) pass through untouched for the sections that want
+ * them.
+ *
+ * `decided` rides along on the same object, so `by("action")` picks the row up
+ * too — in schema 2 the verdict and the intent genuinely ARE one fact, and
+ * counting them as one row is the point of the change.
+ */
+function normalize(r) {
+  if ((r.schema ?? 1) < 2 || r.event !== "decision") return r
+  const judged = r.outcome === "safe" || r.outcome === "risky"
+  const why = r.unjudged_why ?? null
+  return {
+    ...r,
+    event: "classification",
+    verdict: judged ? r.outcome.toUpperCase() : null,
+    failure: judged ? null : why,
+    ...(SKIP_REASONS.has(why) ? { skipped: why } : {}),
+    latency_ms: r.ms ?? null,
+  }
+}
 // Server-side cascades (one "reject" rejects all pending; one "always" can
 // auto-approve matching siblings) land within the same instant. No human
 // answers two separate prompts 250 ms apart.
@@ -113,15 +143,18 @@ for (const f of files) {
     // A line that parses to null/a scalar is still a lost record — counting it
     // as "fine" is how a corrupted log reads as a complete one.
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { badLines++; continue }
-    events.push(parsed)
+    events.push(normalize(parsed))
   }
 }
 if (since) events = events.filter((e) => !e.ts || e.ts.slice(0, 10) >= since)
 
 const by = (kind) => events.filter((e) => e.event === kind)
+const schema2 = events.filter((e) => (e.schema ?? 1) >= 2)
 const received = by("permission.received")
 const classificationsAll = by("classification")
-const actions = by("action")
+// Schema 1 wrote a separate `action` row; schema 2 puts `decided` on the
+// decision row itself. Both are "what the gate said it would do".
+const actions = [...by("action"), ...events.filter((e) => (e.schema ?? 1) >= 2 && e.event === "classification" && e.decided)]
 const skipped = by("permission.skipped")
 const selfDecisions = by("self.decision")
 const breakerOpens = by("breaker.open")
@@ -153,6 +186,62 @@ const pct = (p) => (latencies.length ? latencies[Math.min(latencies.length - 1, 
 
 // Mixed prompt/model/endpoint data must not be blended into one gate silently.
 const promptCombos = [...new Set(attempted.map((c) => `${c.model ?? "?"} @ ${c.prompt_version ?? "unstamped"} @ ${c.endpoint ?? "?"}`))]
+
+// --- shadow health (schema 2 only) ------------------------------------------
+// What the schema-1 rows could not answer without a join, and what an outage
+// hides in: how much traffic got judged at all, what stopped the rest, and
+// whether the primary's fallback list is buying anything.
+const decisionRows = schema2.filter((e) => e.event === "classification" && e.outcome)
+const health = decisionRows.length ? (() => {
+  const outcomes = {}, unjudgedWhy = {}, stages = {}, byRule = {}
+  let judged = 0, local = 0, cached = 0
+  const msAll = [], depths = []
+  let retried = 0, rescued = 0, fbFirst = null, fbLast = null
+  for (const r of decisionRows) {
+    outcomes[r.outcome] = (outcomes[r.outcome] ?? 0) + 1
+    if (r.outcome === "safe" || r.outcome === "risky") judged++
+    else if (r.unjudged_why) {
+      const k = String(r.unjudged_why).replace(/^fetch_error:[\s\S]*/, "fetch_error")
+      unjudgedWhy[k] = (unjudgedWhy[k] ?? 0) + 1
+    }
+    const st = r.stage ?? "(none)"
+    stages[st] = (stages[st] ?? 0) + 1
+    // The model was never asked. Two ways in, and they are worth telling
+    // apart: a rule DERIVED the answer here, a cache REUSED one from before.
+    if (r.cached) { local++; cached++ }
+    else if (st === "rules") { local++; byRule[r.rule ?? "(unnamed)"] = (byRule[r.rule ?? "(unnamed)"] ?? 0) + 1 }
+    if (Number.isFinite(r.ms) && !r.cached) msAll.push(r.ms)
+    if (Number.isFinite(r.queue_depth)) depths.push(r.queue_depth)
+    const prim = Array.isArray(r.attempts) ? r.attempts.filter((a) => a.role === "primary") : []
+    if (prim.length > 1) {
+      retried++
+      if (prim[prim.length - 1].failure === null) rescued++
+      // When the retries happened, not just how many. A config change mid-window
+      // leaves rows on both sides of it, and a warning with no dates reads as
+      // current forever — which is how a section stops being read.
+      if (!fbFirst || r.ts < fbFirst) fbFirst = r.ts
+      if (!fbLast || r.ts > fbLast) fbLast = r.ts
+    }
+  }
+  msAll.sort((a, b) => a - b); depths.sort((a, b) => a - b)
+  const q = (arr, p) => (arr.length ? arr[Math.min(arr.length - 1, Math.ceil((p / 100) * arr.length) - 1)] : null)
+  // A dispatch with no decision is a worker that died before logging: the one
+  // hole the single-row schema cannot see on its own, which is why the tiny
+  // `dispatch` row survives.
+  const decided = new Set(decisionRows.map((r) => r.tool_use_id ?? r.permission_id).filter(Boolean))
+  const orphans = by("dispatch").filter((d) => {
+    const k = d.tool_use_id ?? d.permission_id
+    return k && !decided.has(k)
+  }).length
+  return {
+    rows: decisionRows.length, judged, outcomes, unjudged_why: unjudgedWhy, stages,
+    local: { total: local, cached, by_rule: byRule },
+    ms: { p50: q(msAll, 50), p90: q(msAll, 90), p99: q(msAll, 99), max: msAll.length ? msAll[msAll.length - 1] : null, n: msAll.length },
+    queue: { p50: q(depths, 50), max: depths.length ? depths[depths.length - 1] : null, n: depths.length },
+    dispatch_orphans: orphans,
+    fallback: { retried, rescued, first: fbFirst, last: fbLast },
+  }
+})() : null
 
 // --- assemble ground truth ---------------------------------------------------
 // Join human.decision with human.decision.amended by permission_id: the
@@ -424,6 +513,7 @@ const summary = {
     uncovered_tools: count(actions, (a) => a.decided ?? "unknown")["veto_uncovered_tool"] ?? 0,
   },
   actions: count(actions, (a) => a.decided ?? "unknown"),
+  shadow_health: health,
   classified_but_never_answered: classifiedNoDecision,
   orphan_amendments: orphanAmendments,
   breaker_opens: breakerOpens.length,
@@ -508,6 +598,45 @@ if (asJson) {
     lines.push(`Headless veto path: ${v.classifications} classifications, ${v.blocks} blocks, ${v.would_blocks} would-block (shadow), ${v.passes} passes, ${v.uncovered_tools} uncovered tool calls (excluded from the gates above)`)
   }
   lines.push(`Actions: ${kv(summary.actions)}`)
+  const schema1Rows = events.filter((e) => (e.schema ?? 1) < 2 && e.event === "classification").length
+  if (!health && schema1Rows) {
+    lines.push(``)
+    lines.push(`Shadow health: unavailable — this window is schema 1, which carries no outcome/attempts fields.`)
+    lines.push(`  Coverage and fallback waste cannot be computed from it.`)
+  }
+  if (health) {
+    lines.push(``)
+    lines.push(`Shadow health (schema 2, n=${health.rows} decision rows)`)
+    // A mixed window is the normal case right after a schema change, and a
+    // health block computed over the schema-2 slice alone reads as if it
+    // covered everything. Say what it did not cover.
+    if (schema1Rows) lines.push(`  NOTE: ${schema1Rows} schema-1 row(s) here are NOT counted — they carry no outcome/attempts fields`)
+    lines.push(`  judged: ${health.judged} of ${health.rows} (${fmtPct(health.judged / health.rows)}) — outcomes ${kv(health.outcomes)}`)
+    if (Object.keys(health.unjudged_why).length) lines.push(`  never judged, by cause: ${kv(health.unjudged_why)}`)
+    lines.push(`  by stage: ${kv(health.stages)}`)
+    // What never reached the model at all. This is the number the local layers
+    // exist for: every one of these is an HTTP request not made against a
+    // server that serves one request at a time.
+    if (health.local.total) {
+      lines.push(`  decided WITHOUT the model: ${health.local.total} of ${health.rows} (${fmtPct(health.local.total / health.rows)})` +
+        `${health.local.cached ? ` — ${health.local.cached} from cache` : ""}`)
+      if (Object.keys(health.local.by_rule).length) lines.push(`    by rule: ${kv(health.local.by_rule)}`)
+    }
+    lines.push(`  time to decision: p50 ${health.ms.p50 ?? "-"} ms, p90 ${health.ms.p90 ?? "-"} ms, p99 ${health.ms.p99 ?? "-"} ms, max ${health.ms.max ?? "-"} ms`)
+    if (health.queue.n) lines.push(`  queue depth at entry: p50 ${health.queue.p50}, max ${health.queue.max} (n=${health.queue.n})`)
+    if (health.dispatch_orphans) lines.push(`  DISPATCHED WITH NO DECISION: ${health.dispatch_orphans} — a worker died before it could log`)
+    // The fallback list is the thing that cost 41% of the 2026-09-06..09
+    // window, so it gets its own line whether or not it misbehaved: a retry
+    // rate with a near-zero rescue rate means the addresses are not really
+    // independent, and the budget is being spent twice for nothing.
+    if (health.fallback.retried) {
+      const when = health.fallback.first ? ` [${health.fallback.first.slice(11, 19)}..${health.fallback.last.slice(11, 19)}Z]` : ""
+      lines.push(`  primary fallback: ${health.fallback.retried} call(s) tried a second address, ${health.fallback.rescued} rescued (${fmtPct(health.fallback.rescued / health.fallback.retried)})${when}`)
+      if (health.fallback.rescued / health.fallback.retried < 0.25) {
+        lines.push(`    WARNING: under 25% rescued — the fallback addresses are probably not independent failure domains`)
+      }
+    }
+  }
   if (summary.classified_but_never_answered) lines.push(`Classified but never answered: ${summary.classified_but_never_answered} (session abandoned or still pending at log time)`)
   if (breakerOpens.length) lines.push(`Circuit breaker opened ${breakerOpens.length} time(s)`)
   if (pluginErrors.length) {

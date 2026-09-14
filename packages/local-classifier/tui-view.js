@@ -80,13 +80,15 @@ export function apply(state, record, now = Date.now()) {
       else entries[i] = { ...entries[i], ...entry }
       break
     }
-    case "classification": {
+    case "decision": {
+      // Schema 2 replaced `verdict`/`failure`/`skipped` with a closed-set
+      // `outcome` plus `unjudged_why`. The box wants the old two fields, so
+      // map back: anything that is not a verdict is a failure with a reason.
+      const judged = record.outcome === "safe" || record.outcome === "risky"
       const fields = {
-        verdict: record.verdict ?? null,
+        verdict: judged ? record.outcome.toUpperCase() : null,
         reason: record.reason ?? null,
-        // `skipped` is the breaker's line: no call was made, so there is no
-        // verdict and no failure either, and only this field says why.
-        failure: record.failure ?? record.skipped ?? null,
+        failure: judged ? null : (record.unjudged_why ?? null),
       }
       // A box that started mid-flight has no "received" for this id. Showing
       // it from the classification alone beats showing nothing.

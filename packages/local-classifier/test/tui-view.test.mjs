@@ -21,9 +21,12 @@ const received = (id, command, at = T0) => ({
   ts: iso(at), event: "permission.received", permission_id: id, session_id: "s1",
   permission: "bash", metadata: { command }, covered: true,
 })
+// Schema 2: one `decision` row, `outcome` closed-set rather than a nullable
+// `verdict` beside a nullable `failure` beside a nullable `skipped`.
 const classified = (id, verdict, reason, at = T0 + 2_000, extra = {}) => ({
-  ts: iso(at), event: "classification", permission_id: id, session_id: "s1",
-  subject: "git status", verdict, reason, failure: null, ...extra,
+  ts: iso(at), event: "decision", permission_id: id, session_id: "s1",
+  subject: "git status", outcome: verdict ? verdict.toLowerCase() : "unjudged",
+  unjudged_why: null, reason, ...extra,
 })
 // The countdown STARTS here. `action.reply_intent` is a different record,
 // written after the wait is over as the audit line for the reply itself —
@@ -77,7 +80,7 @@ describe("the box follows one permission from ask to outcome", () => {
   })
 
   test("a classifier failure is not silence — it reads as failed, in the failure tone", () => {
-    const s = feed([received("p1", "npm ci"), classified("p1", null, null, T0 + 2_000, { failure: "timeout" })])
+    const s = feed([received("p1", "npm ci"), classified("p1", null, null, T0 + 2_000, { unjudged_why: "timeout" })])
     const v = view(s, T0 + 2_500)
     expect(v.tone).toBe("failed")
     expect(v.headline).toMatch(/timeout/)
@@ -185,7 +188,7 @@ describe("the box stays quiet when the plugin has nothing to say", () => {
   test("a classification the breaker refused reads as a failure, not as an eternal spinner", () => {
     const s = feed([
       received("p1", "ls"),
-      { ts: iso(T0 + 10), event: "classification", permission_id: "p1", subject: "ls", skipped: "breaker_open" },
+      { ts: iso(T0 + 10), event: "decision", permission_id: "p1", subject: "git status", outcome: "unjudged", unjudged_why: "breaker_open" },
     ])
     const v = view(s, T0 + 100)
     expect(v.tone).toBe("failed")
